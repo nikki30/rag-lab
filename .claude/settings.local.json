@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(venv/Scripts/uvicorn main:app --reload --port 8000)",
+      "Bash(npm run:*)",
+      "Bash(powershell -Command \"Start-Process -NoNewWindow -FilePath 'venv/Scripts/uvicorn.exe' -ArgumentList 'main:app','--reload','--port','8000' -RedirectStandardOutput 'uvicorn.log' -RedirectStandardError 'uvicorn_err.log'\")",
+      "Bash(venv/Scripts/pip list:*)",
+      "Bash(venv/Scripts/pip install:*)",
+      "Bash(venv/Scripts/python -c \"import sklearn; import numpy; print\\('OK'\\)\")",
+      "Bash(venv/Scripts/pip show:*)",
+      "Bash(python -c \"import sys,json; routes=[r['path'] for r in json.load\\(sys.stdin\\)['paths']]; print\\('\\\\n'.join\\(routes\\)\\)\")",
+      "Bash(venv/Scripts/python -c \"import main; print\\('OK'\\)\")",
+      "Bash(venv/Scripts/python -c \"from main import app; routes = [r.path for r in app.routes]; print\\('\\\\n'.join\\(routes\\)\\)\")",
+      "Bash(powershell -Command \"Get-NetTCPConnection -LocalPort 8000 -State Listen | Select-Object -ExpandProperty OwningProcess\")",
+      "Bash(netstat -ano)",
+      "Bash(taskkill /PID 917944 /F)",
+      "Bash(taskkill /PID 284976 /F)",
+      "Bash(powershell -Command \"Stop-Process -Id 917944 -Force; Stop-Process -Id 284976 -Force\")",
+      "Bash(powershell -Command \"Get-Process -Id 917944, 284976 | Select-Object Id, ProcessName, CommandLine\")",
+      "Bash(powershell -Command \"Start-Process -NoNewWindow 'venv/Scripts/uvicorn.exe' -ArgumentList 'main:app','--port','8000' -RedirectStandardOutput 'uvicorn.log' -RedirectStandardError 'uvicorn_err.log'\")",
+      "Bash(powershell -Command \"Get-Process -Id 284976 -ErrorAction SilentlyContinue; Get-Process -Id 917944 -ErrorAction SilentlyContinue\")",
+      "Bash(powershell -Command \"Get-Process python* | Select-Object Id, ProcessName\")",
+      "Bash(powershell -Command \"Get-Process python* | Stop-Process -Force\")",
+      "Bash(git checkout:*)",
+      "Bash(git add:*)"
+    ]
+  }
+}
