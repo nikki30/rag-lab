@@ -22,7 +22,13 @@
       "Bash(powershell -Command \"Get-Process python* | Select-Object Id, ProcessName\")",
       "Bash(powershell -Command \"Get-Process python* | Stop-Process -Force\")",
       "Bash(git checkout:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git commit -m ':*)",
+      "Bash(git push:*)",
+      "Bash(git filter-repo:*)",
+      "Bash(git filter-branch --env-filter ':*)",
+      "Bash(git stash:*)",
+      "Bash(git commit:*)"
     ]
   }
 }
