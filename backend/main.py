@@ -235,6 +235,7 @@ def build_response(
 # ── Embedding ─────────────────────────────────────────────────────────────────
 
 EmbedModelId = Literal["minilm", "bge-small", "mpnet", "nomic"]
+ReductionId = Literal["pca", "umap", "pacmap"]
 
 EMBED_MODELS: dict[str, str] = {
     "minilm":    "sentence-transformers/all-MiniLM-L6-v2",
@@ -259,7 +260,7 @@ def get_model(model_id: EmbedModelId):
 class EmbedRequest(BaseModel):
     chunks: List[str]
     model: EmbedModelId = "minilm"
-    reduction: Literal["pca", "umap"] = "pca"
+    reduction: ReductionId = "pca"
 
 
 def reduce_pca(vectors: np.ndarray) -> list[list[float]]:
@@ -281,6 +282,19 @@ def reduce_umap(vectors: np.ndarray) -> list[list[float]]:
     n_neighbors = min(15, n - 1)
     reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors, random_state=42)
     coords = reducer.fit_transform(vectors)
+    return coords.tolist()
+
+
+def reduce_pacmap(vectors: np.ndarray) -> list[list[float]]:
+    import pacmap
+    n = len(vectors)
+    if n < 2:
+        return [[0.0, 0.0]] * n
+    n_neighbors = min(10, n - 1)
+    # PaCMAP requires float32
+    v32 = vectors.astype(np.float32)
+    reducer = pacmap.PaCMAP(n_components=2, n_neighbors=n_neighbors, random_state=42)
+    coords = reducer.fit_transform(v32)
     return coords.tolist()
 
 
@@ -327,6 +341,8 @@ async def embed_chunks(request: EmbedRequest):
         # 2-D projection
         if request.reduction == "umap" and len(request.chunks) >= 4:
             coords_2d = reduce_umap(vectors)
+        elif request.reduction == "pacmap" and len(request.chunks) >= 4:
+            coords_2d = reduce_pacmap(vectors)
         else:
             coords_2d = reduce_pca(vectors)
 
