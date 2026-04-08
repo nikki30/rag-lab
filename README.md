@@ -7,13 +7,13 @@ An interactive, local-first laboratory for exploring RAG pipeline decisions visu
 | Stage | Status | What you can do |
 |-------|--------|-----------------|
 | **Chunking** | Done | Compare 5 strategies (recursive, fixed, paragraph, sentence, semantic), tune parameters, inspect per-chunk quality scores, and see topic-similarity between sentences on a live chart |
-| **Embedding** | Planned | Convert chunks to dense vectors using local sentence-transformers models, visualise the vector space as a 2D scatter plot (PCA / UMAP), swap models and watch the space change |
-| **Indexing** | Planned | Index the embeddings with HNSW and DiskANN, compare recall vs latency tradeoffs interactively |
-| **Retrieval** | Planned | Issue queries and see which chunks are retrieved, explore GraphRAG's multi-hop graph traversal against flat vector search |
+| **Embedding** | Done | Embed chunks with 4 local models (MiniLM, BGE-Small, MPNet, Nomic), visualise the vector space with PCA / UMAP / PaCMAP, inspect the cosine similarity heatmap with chunking-issue detection, and explore raw vector values |
+| **Retrieval** | Planned | Type a query, embed it in the same space, see which chunks are nearest — then add HNSW indexing to show how approximate search scales to millions of vectors |
+| **Reranking** | Planned | Cross-encoder reranking on top of vector retrieval for higher accuracy |
 
 ## Stack
 
-- **Backend** — FastAPI, Python, LangChain text splitters, TF-IDF cosine similarity (chunking), sentence-transformers + scikit-learn (embedding, upcoming)
+- **Backend** — FastAPI, Python, LangChain text splitters, sentence-transformers, scikit-learn, umap-learn, pacmap
 - **Frontend** — Next.js, React, TypeScript, Tailwind CSS v4, App Router
 
 ## Running locally
@@ -32,3 +32,5 @@ If port 8000 is stuck:
 ```bash
 powershell -Command "Get-Process python* | Stop-Process -Force"
 ```
+
+> First run of the embedding stage will download the selected model (~90–400 MB). Subsequent runs use the cached version.
