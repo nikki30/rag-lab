@@ -1,10 +1,12 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, model_validator
 from langchain_text_splitters import RecursiveCharacterTextSplitter, CharacterTextSplitter
 from fastapi.middleware.cors import CORSMiddleware
 import re
 import math
-from typing import Literal, Optional
+from typing import Literal, Optional, List
+import numpy as np
+from sklearn.decomposition import PCA
 
 app = FastAPI(title="RAG Lab Backend")
 
@@ -230,6 +232,58 @@ def build_response(
     }
 
 
+# ── Embedding ─────────────────────────────────────────────────────────────────
+
+EmbedModelId = Literal["minilm", "bge-small", "mpnet", "nomic"]
+
+EMBED_MODELS: dict[str, str] = {
+    "minilm":    "sentence-transformers/all-MiniLM-L6-v2",
+    "bge-small": "BAAI/bge-small-en-v1.5",
+    "mpnet":     "sentence-transformers/all-mpnet-base-v2",
+    "nomic":     "nomic-ai/nomic-embed-text-v1.5",
+}
+
+# Cache loaded models so we don't reload on every request
+_model_cache: dict[str, object] = {}
+
+def get_model(model_id: EmbedModelId):
+    if model_id not in _model_cache:
+        from sentence_transformers import SentenceTransformer
+        trust = model_id == "nomic"  # nomic requires trust_remote_code
+        _model_cache[model_id] = SentenceTransformer(
+            EMBED_MODELS[model_id], trust_remote_code=trust
+        )
+    return _model_cache[model_id]
+
+
+class EmbedRequest(BaseModel):
+    chunks: List[str]
+    model: EmbedModelId = "minilm"
+    reduction: Literal["pca", "umap"] = "pca"
+
+
+def reduce_pca(vectors: np.ndarray) -> list[list[float]]:
+    n = len(vectors)
+    if n < 2:
+        return [[0.0, 0.0]] * n
+    n_components = min(2, n)
+    coords = PCA(n_components=n_components).fit_transform(vectors)
+    if coords.shape[1] < 2:
+        coords = np.hstack([coords, np.zeros((n, 1))])
+    return coords.tolist()
+
+
+def reduce_umap(vectors: np.ndarray) -> list[list[float]]:
+    import umap
+    n = len(vectors)
+    if n < 2:
+        return [[0.0, 0.0]] * n
+    n_neighbors = min(15, n - 1)
+    reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors, random_state=42)
+    coords = reducer.fit_transform(vectors)
+    return coords.tolist()
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/")
@@ -255,6 +309,39 @@ async def chunk_text(request: ChunkRequest):
         )
 
     return build_response(request.text, chunks, request.chunk_size, similarity_scores)
+
+
+@app.post("/api/embed")
+async def embed_chunks(request: EmbedRequest):
+    if not request.chunks:
+        raise HTTPException(status_code=400, detail="No chunks provided")
+    try:
+        model = get_model(request.model)
+        # nomic requires a task prefix
+        texts = (
+            [f"search_document: {c}" for c in request.chunks]
+            if request.model == "nomic" else request.chunks
+        )
+        vectors: np.ndarray = model.encode(texts, normalize_embeddings=True)
+
+        # 2-D projection
+        if request.reduction == "umap" and len(request.chunks) >= 4:
+            coords_2d = reduce_umap(vectors)
+        else:
+            coords_2d = reduce_pca(vectors)
+
+        # Cosine similarity matrix (vectors are already L2-normalised → dot product = cosine)
+        sim_matrix = (vectors @ vectors.T).tolist()
+
+        return {
+            "model": request.model,
+            "dimensions": int(vectors.shape[1]),
+            "coords_2d": coords_2d,            # [[x, y], ...]  — one per chunk
+            "similarity_matrix": sim_matrix,   # N×N cosine similarities
+            "vectors": vectors.tolist(),        # raw vectors for inspector
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/compare")

@@ -211,3 +211,4 @@ docs-internal/private_*
 __pycache__/
 node_modules/
 .next/
+internaldoc/

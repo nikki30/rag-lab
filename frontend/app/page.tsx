@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useMemo } from 'react'
+import React, { useState, useMemo, useRef } from 'react'
 
 const SAMPLE_TEXT = `Retrieval-Augmented Generation (RAG) is a technique that combines the strengths of large language models with external knowledge retrieval. Instead of relying solely on the knowledge encoded in a model's parameters during training, RAG systems first retrieve relevant documents from a knowledge base, then use those documents as context when generating a response.
 
@@ -49,6 +49,18 @@ interface Stats { avg_size: number; min_size: number; max_size: number; std_dev:
 interface ChunkResponse { chunks: Chunk[]; total: number; stats: Stats; similarity_scores: number[] | null }
 interface CompareResult { total: number; avg_size: number; min_size: number; max_size: number; std_dev: number; avg_quality: number; sizes: number[]; preview_chunks: string[]; error?: string }
 type CompareResponse = Record<Strategy, CompareResult>
+
+type EmbedModelId = 'minilm' | 'bge-small' | 'mpnet' | 'nomic'
+type Reduction = 'pca' | 'umap'
+interface EmbedModel { id: EmbedModelId; label: string; dims: number; speed: string; description: string; tagline: string }
+interface EmbedResult { model: EmbedModelId; dimensions: number; coords_2d: [number, number][]; similarity_matrix: number[][]; vectors: number[][] }
+
+const EMBED_MODELS: EmbedModel[] = [
+  { id: 'minilm',    label: 'MiniLM-L6',       dims: 384, speed: 'Fast',    tagline: 'Industry default',       description: 'The workhorse of local RAG. Small, fast, surprisingly good. 384 numbers per chunk. Best starting point.' },
+  { id: 'bge-small', label: 'BGE-Small',        dims: 384, speed: 'Fast',    tagline: 'State-of-the-art small', description: 'BAAI\'s model beats MiniLM on retrieval benchmarks at the same size. Same speed, better recall. Current SOTA at 384d.' },
+  { id: 'mpnet',     label: 'MPNet-Base',       dims: 768, speed: 'Medium',  tagline: 'More accurate, 2× size', description: 'Doubles the vector size (768d) for higher accuracy. Takes ~2× longer to embed. Good when recall matters more than speed.' },
+  { id: 'nomic',     label: 'Nomic-Embed-1.5',  dims: 768, speed: 'Medium',  tagline: 'Best open-source 2024',  description: 'Top open-source general embedding model. Supports Matryoshka — you can shrink vectors from 768d down to 64d with graceful accuracy loss. Cutting edge.' },
+]
 
 // ── Tooltip ───────────────────────────────────────────────────────────────────
 // Uses position:fixed so it escapes any parent overflow:auto clipping context.
@@ -196,17 +208,48 @@ export default function Home() {
   const [activeChunk, setActiveChunk] = useState<number | null>(null)
   const [view, setView] = useState<MainView>('highlight')
 
+  // ── Embedding stage ──
+  const [embedModel, setEmbedModel] = useState<EmbedModelId>('minilm')
+  const [reduction, setReduction] = useState<Reduction>('pca')
+  const [embedResult, setEmbedResult] = useState<EmbedResult | null>(null)
+  const [embedLoading, setEmbedLoading] = useState(false)
+  const [embedError, setEmbedError] = useState<string | null>(null)
+  const [embedStale, setEmbedStale] = useState(false)   // chunks changed since last embed
+  const [hoveredEmbedChunk, setHoveredEmbedChunk] = useState<number | null>(null)
+  const [selectedEmbedChunk, setSelectedEmbedChunk] = useState<number | null>(null)
+  const embedSectionRef = useRef<HTMLDivElement>(null)
+
   const overlapError = strategy !== 'semantic' && chunkOverlap >= chunkSize
     ? 'Overlap must be less than chunk size' : null
 
-  function resetResults() { setChunks([]); setStats(null); setSimilarityScores(null); setCompareData(null) }
+  function resetResults() { setChunks([]); setStats(null); setSimilarityScores(null); setCompareData(null); setEmbedResult(null); setEmbedStale(false) }
   // When only the threshold changes, scores stay — only the coloring updates live
-  function resetChunksOnly() { setChunks([]); setStats(null); setCompareData(null) }
+  function resetChunksOnly() { setChunks([]); setStats(null); setCompareData(null); setEmbedStale(true) }
+
+  async function handleEmbed(overrideModel?: EmbedModelId, overrideReduction?: Reduction) {
+    if (!chunks.length) return
+    const model = overrideModel ?? embedModel
+    const red = overrideReduction ?? reduction
+    setEmbedLoading(true); setEmbedError(null); setEmbedStale(false)
+    setSelectedEmbedChunk(null); setHoveredEmbedChunk(null)
+    try {
+      const res = await fetch('http://localhost:8000/api/embed', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chunks: chunks.map(c => c.page_content), model, reduction: red }),
+      })
+      if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b?.detail ?? `Error ${res.status}`) }
+      setEmbedResult(await res.json())
+      setTimeout(() => embedSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100)
+    } catch (e) { setEmbedError(e instanceof Error ? e.message : 'Unknown error') }
+    finally { setEmbedLoading(false) }
+  }
 
   async function handleChunk(overrideStrategy?: Strategy) {
     const activeStrategy = overrideStrategy ?? strategy
     if (activeStrategy !== 'semantic' && chunkOverlap >= chunkSize) return
     setLoading(true); setError(null); resetResults()
+    setEmbedStale(true)
     try {
       const res = await fetch('http://localhost:8000/api/chunk', {
         method: 'POST',
@@ -254,7 +297,7 @@ export default function Home() {
         <div className="max-w-6xl mx-auto flex items-center gap-3">
           <div className="w-7 h-7 rounded-md bg-violet-600 flex items-center justify-center text-xs font-bold">R</div>
           <h1 className="text-lg font-semibold tracking-tight">RAG Lab</h1>
-          <span className="ml-2 text-xs text-zinc-500 bg-zinc-800 px-2 py-0.5 rounded-full">chunker</span>
+          <span className="ml-2 text-xs text-zinc-500 bg-zinc-800 px-2 py-0.5 rounded-full">chunker → embedder</span>
         </div>
       </header>
 
@@ -607,7 +650,380 @@ export default function Home() {
             )}
           </section>
         )}
+
+        {/* ── Embed CTA — appears once chunks exist ── */}
+        {chunks.length > 0 && (
+          <div className="flex items-center gap-4 rounded-xl border border-zinc-800 bg-zinc-900/60 px-5 py-4">
+            <div className="flex-1">
+              <p className="text-sm font-semibold text-zinc-200">Ready to embed</p>
+              <p className="text-xs text-zinc-500 mt-0.5">
+                {embedStale && embedResult ? 'Chunks changed — re-embed to update the vector space.' : `Convert your ${chunks.length} chunks into vectors so they can be searched semantically.`}
+              </p>
+            </div>
+            <button
+              onClick={() => handleEmbed()}
+              disabled={embedLoading}
+              className={`px-5 py-2 rounded-lg text-sm font-semibold transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${embedStale && embedResult ? 'bg-amber-600 hover:bg-amber-500 text-white' : 'bg-emerald-600 hover:bg-emerald-500 text-white'}`}
+            >
+              {embedLoading ? 'Embedding…' : embedStale && embedResult ? 'Re-embed Chunks' : 'Embed Chunks →'}
+            </button>
+          </div>
+        )}
       </main>
+
+      {/* ══════════════════════════════════════════════════════════════════════
+          STAGE 2 — EMBEDDING
+      ══════════════════════════════════════════════════════════════════════ */}
+      {(embedResult || embedLoading || embedError) && (
+        <div ref={embedSectionRef} className="border-t-2 border-zinc-800 mt-2">
+          <main className="max-w-6xl mx-auto px-6 py-8 space-y-6">
+
+            {/* Stage header */}
+            <div className="flex items-center gap-3">
+              <div className="w-7 h-7 rounded-md bg-emerald-600 flex items-center justify-center text-xs font-bold">2</div>
+              <h2 className="text-lg font-semibold tracking-tight">Embedding</h2>
+              <div className="flex items-center gap-1.5 ml-1">
+                <InfoTooltip
+                  title="What is embedding?"
+                  body={"Embedding turns text into numbers — specifically a list of hundreds of numbers called a vector.\n\nEach vector is a point in high-dimensional space. Chunks about similar topics end up near each other. Chunks about different topics are far apart.\n\nThis is what makes semantic search possible: instead of matching keywords, the retriever finds the chunks whose vectors are closest to the query vector.\n\nThe embedding model is what does this conversion. Different models produce different spaces — some are better at retrieval, some are more compact, some are more accurate."}
+                  pos="top-right"
+                />
+              </div>
+              <span className="ml-auto text-xs text-zinc-600 font-mono">{chunks.length} chunks from stage 1</span>
+            </div>
+
+            {/* Model picker */}
+            <div>
+              <div className="flex items-center gap-2 mb-3">
+                <p className="text-xs font-medium text-zinc-500 uppercase tracking-wider">Embedding Model</p>
+                <InfoTooltip
+                  title="Which model should I pick?"
+                  body={"Each model converts your text into vectors differently. They've been trained on different data with different objectives.\n\nStart with MiniLM — it's the fastest and a good baseline. Then try BGE-Small to see if retrieval improves. MPNet and Nomic are heavier but more accurate.\n\nWatch the scatter plot change between models — same chunks, different geometry. That geometry is what your retriever will search."}
+                  pos="top-right"
+                />
+              </div>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                {EMBED_MODELS.map(m => (
+                  <button key={m.id}
+                    onClick={() => { setEmbedModel(m.id); if (embedResult) handleEmbed(m.id, reduction) }}
+                    className={`rounded-xl border px-3 py-3 text-left transition-all ${embedModel === m.id ? 'border-emerald-500 bg-emerald-500/10 text-zinc-100' : 'border-zinc-800 bg-zinc-900 text-zinc-400 hover:border-zinc-600'}`}>
+                    <div className="flex items-start justify-between mb-1">
+                      <p className="text-sm font-semibold">{m.label}</p>
+                      <InfoTooltip title={m.label} body={m.description} pos="top-left" />
+                    </div>
+                    <p className="text-xs text-zinc-500 mb-1">{m.tagline}</p>
+                    <div className="flex gap-2 text-xs">
+                      <span className="text-zinc-600">{m.dims}d</span>
+                      <span className={`${m.speed === 'Fast' ? 'text-emerald-500' : 'text-amber-500'}`}>{m.speed}</span>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {embedError && <div className="rounded-xl border border-red-800 bg-red-950/40 px-4 py-3 text-sm text-red-400">{embedError}</div>}
+
+            {embedLoading && (
+              <div className="rounded-xl bg-zinc-900 border border-zinc-800 px-5 py-10 text-center space-y-2">
+                <p className="text-sm text-zinc-400">Embedding {chunks.length} chunks with {EMBED_MODELS.find(m => m.id === embedModel)?.label}…</p>
+                <p className="text-xs text-zinc-600">First run downloads the model (~90–400 MB). Subsequent runs are instant.</p>
+              </div>
+            )}
+
+            {embedResult && !embedLoading && (
+              <div className="space-y-6">
+
+                {/* Stats bar */}
+                <div className="flex items-center gap-3 flex-wrap">
+                  <StatPill label={`${embedResult.dimensions} dimensions`}
+                    tooltip={{ title: 'Vector dimensions', body: 'Each chunk is represented by this many numbers. More dimensions = the model can capture finer distinctions between concepts, but uses more memory and is slower to search.\n\nMiniLM and BGE-Small use 384. MPNet and Nomic use 768. In practice the difference is small for a single document.' }} />
+                  <StatPill label={`${embedResult.coords_2d.length} vectors`}
+                    tooltip={{ title: 'Vectors produced', body: 'One vector per chunk. These are the points you see on the scatter plot below.' }} />
+                  <div className="ml-auto flex items-center gap-1.5 rounded-lg border border-zinc-700 overflow-hidden text-xs">
+                    <span className="px-2 py-1 text-zinc-500">Projection</span>
+                    {(['pca', 'umap'] as Reduction[]).map(r => (
+                      <button key={r} onClick={() => { setReduction(r); handleEmbed(embedModel, r) }}
+                        className={`px-3 py-1.5 uppercase font-mono transition-colors ${reduction === r ? 'bg-zinc-700 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300'}`}>
+                        {r}
+                      </button>
+                    ))}
+                    <InfoTooltip
+                      title="PCA vs UMAP — what's the difference?"
+                      body={"Both squash your high-dimensional vectors down to 2D so you can see them.\n\nPCA — fast, deterministic, straight linear math. Sometimes squashes clusters together even when they're truly separate in the full space.\n\nUMAP — smarter layout algorithm, preserves neighbourhood structure better. Much better at revealing genuine clusters. Takes ~2s extra.\n\nTip: start with PCA to understand the shape, switch to UMAP to see if clusters are real."}
+                      pos="top-left"
+                    />
+                  </div>
+                </div>
+
+                {/* Scatter plot */}
+                <EmbedScatterPlot
+                  coords={embedResult.coords_2d}
+                  chunks={chunks}
+                  hovered={hoveredEmbedChunk}
+                  selected={selectedEmbedChunk}
+                  onHover={setHoveredEmbedChunk}
+                  onSelect={setSelectedEmbedChunk}
+                  reduction={reduction}
+                />
+
+                {/* Similarity heatmap */}
+                <EmbedHeatmap
+                  matrix={embedResult.similarity_matrix}
+                  chunks={chunks}
+                  hovered={hoveredEmbedChunk}
+                  selected={selectedEmbedChunk}
+                  onHover={setHoveredEmbedChunk}
+                  onSelect={setSelectedEmbedChunk}
+                />
+
+                {/* Vector inspector */}
+                {selectedEmbedChunk !== null && (
+                  <VectorInspector
+                    vector={embedResult.vectors[selectedEmbedChunk]}
+                    chunkIndex={selectedEmbedChunk}
+                    chunk={chunks[selectedEmbedChunk]}
+                  />
+                )}
+              </div>
+            )}
+          </main>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── Embed scatter plot ────────────────────────────────────────────────────────
+function EmbedScatterPlot({ coords, chunks, hovered, selected, onHover, onSelect, reduction }: {
+  coords: [number, number][]; chunks: Chunk[]
+  hovered: number | null; selected: number | null
+  onHover: (i: number | null) => void; onSelect: (i: number | null) => void
+  reduction: Reduction
+}) {
+  const W = 600, H = 340, PAD = 32
+  const xs = coords.map(c => c[0]), ys = coords.map(c => c[1])
+  const xMin = Math.min(...xs), xMax = Math.max(...xs)
+  const yMin = Math.min(...ys), yMax = Math.max(...ys)
+  const xRange = xMax - xMin || 1, yRange = yMax - yMin || 1
+
+  function px(x: number) { return PAD + ((x - xMin) / xRange) * (W - PAD * 2) }
+  function py(y: number) { return H - PAD - ((y - yMin) / yRange) * (H - PAD * 2) }
+
+  const activeIdx = selected ?? hovered
+
+  return (
+    <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-4 space-y-3">
+      <div className="flex items-center gap-2">
+        <p className="text-xs font-medium text-zinc-400 uppercase tracking-wider">Vector space — {reduction.toUpperCase()} projection</p>
+        <InfoTooltip
+          title="How to read the scatter plot"
+          body={"Each dot = one chunk. The position comes from squashing your high-dimensional vectors down to 2D.\n\nDots that are close together = chunks with similar meaning. Dots far apart = different topics.\n\nThis is what your retriever sees when searching. A query vector would appear somewhere on this plot — the retriever picks the nearest dots.\n\nClick a dot to inspect its raw vector below. Hover to see the chunk text."}
+          pos="top-right"
+        />
+      </div>
+      <div className="w-full overflow-x-auto">
+        <svg width={W} height={H} className="block mx-auto">
+          {/* Grid lines */}
+          {[0.25, 0.5, 0.75].map(t => (
+            <g key={t} className="text-zinc-800">
+              <line x1={PAD} x2={W - PAD} y1={PAD + t * (H - PAD * 2)} y2={PAD + t * (H - PAD * 2)} stroke="currentColor" strokeDasharray="4,4" />
+              <line x1={PAD + t * (W - PAD * 2)} x2={PAD + t * (W - PAD * 2)} y1={PAD} y2={H - PAD} stroke="currentColor" strokeDasharray="4,4" />
+            </g>
+          ))}
+          {/* Lines from hovered/selected to its neighbours */}
+          {activeIdx !== null && coords.map((_, j) => {
+            if (j === activeIdx) return null
+            return (
+              <line key={j}
+                x1={px(coords[activeIdx][0])} y1={py(coords[activeIdx][1])}
+                x2={px(coords[j][0])} y2={py(coords[j][1])}
+                stroke="#52525b" strokeWidth={0.5} opacity={0.4}
+              />
+            )
+          })}
+          {/* Dots */}
+          {coords.map((c, i) => {
+            const col = COLORS[i % COLORS.length]
+            const isActive = activeIdx === null || activeIdx === i
+            const r = activeIdx === i ? 9 : 6
+            const colMap: Record<string, string> = {
+              'text-violet-300': '#c4b5fd', 'text-sky-300': '#7dd3fc',
+              'text-emerald-300': '#6ee7b7', 'text-amber-300': '#fcd34d',
+              'text-rose-300': '#fda4af', 'text-pink-300': '#f9a8d4',
+              'text-cyan-300': '#67e8f9', 'text-lime-300': '#bef264',
+              'text-orange-300': '#fdba74', 'text-teal-300': '#5eead4',
+            }
+            const fill = colMap[col.text] ?? '#a1a1aa'
+            return (
+              <g key={i} className="cursor-pointer"
+                onMouseEnter={() => onHover(i)} onMouseLeave={() => onHover(null)}
+                onClick={() => onSelect(selected === i ? null : i)}
+              >
+                <circle cx={px(c[0])} cy={py(c[1])} r={r + 6} fill="transparent" />
+                <circle cx={px(c[0])} cy={py(c[1])} r={r}
+                  fill={fill} fillOpacity={isActive ? 0.9 : 0.2}
+                  stroke={fill} strokeWidth={activeIdx === i ? 2 : 1}
+                />
+                <text x={px(c[0])} y={py(c[1]) - r - 3} textAnchor="middle"
+                  fontSize={9} fill={fill} fillOpacity={isActive ? 1 : 0.3}
+                  className="select-none pointer-events-none font-mono">
+                  #{i + 1}
+                </text>
+              </g>
+            )
+          })}
+        </svg>
+      </div>
+      {activeIdx !== null && (
+        <div className="rounded-lg bg-zinc-800 border border-zinc-700 px-3 py-2 text-xs text-zinc-300 leading-relaxed">
+          <span className={`font-mono font-bold ${COLORS[activeIdx % COLORS.length].text} mr-2`}>#{activeIdx + 1}</span>
+          {chunks[activeIdx]?.page_content.slice(0, 160)}{(chunks[activeIdx]?.page_content.length ?? 0) > 160 ? '…' : ''}
+        </div>
+      )}
+      <p className="text-xs text-zinc-600">Click a dot to inspect its raw vector · hover to preview chunk</p>
+    </div>
+  )
+}
+
+// ── Embed heatmap ─────────────────────────────────────────────────────────────
+function EmbedHeatmap({ matrix, chunks, hovered, selected, onHover, onSelect }: {
+  matrix: number[][]; chunks: Chunk[]
+  hovered: number | null; selected: number | null
+  onHover: (i: number | null) => void; onSelect: (i: number | null) => void
+}) {
+  const n = matrix.length
+  // Cell size scales with chunk count — minimum 8px, comfortable up to ~30 chunks
+  const cellSize = Math.max(8, Math.min(36, Math.floor(480 / n)))
+  const showLabels = cellSize >= 18
+
+  function simColor(v: number) {
+    // 0 = cool blue/zinc, 1 = hot red/orange
+    const t = Math.max(0, Math.min(1, v))
+    if (t < 0.4) return `rgba(63,131,248,${0.15 + t * 0.4})`
+    if (t < 0.7) return `rgba(251,191,36,${0.3 + (t - 0.4) * 0.9})`
+    return `rgba(239,68,68,${0.5 + (t - 0.7) * 1.5})`
+  }
+
+  const activeRow = selected ?? hovered
+
+  return (
+    <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-4 space-y-3">
+      <div className="flex items-center gap-2">
+        <p className="text-xs font-medium text-zinc-400 uppercase tracking-wider">Cosine similarity heatmap</p>
+        <InfoTooltip
+          title="How to read the heatmap"
+          body={"Each cell shows how similar two chunks are to each other.\n\nRed/orange = very similar (score near 1.0) — the two chunks are about the same topic.\nBlue = dissimilar (score near 0.0) — different topics.\n\nThe diagonal is always red (a chunk is 100% similar to itself).\n\nLook for off-diagonal red blocks — they reveal chunks that are nearly duplicates, which wastes embedding budget. Look for mostly blue rows — that chunk is topically isolated and will be easy to retrieve precisely."}
+          pos="top-right"
+        />
+      </div>
+      <div className="overflow-auto">
+        <div style={{ display: 'grid', gridTemplateColumns: `${showLabels ? 20 : 0}px repeat(${n}, ${cellSize}px)`, gap: 1 }}>
+          {/* Column headers */}
+          {showLabels && <div />}
+          {Array.from({ length: n }, (_, i) => (
+            <div key={i} style={{ width: cellSize, fontSize: 9 }}
+              className="text-zinc-600 text-center overflow-hidden font-mono">
+              {showLabels ? i + 1 : ''}
+            </div>
+          ))}
+          {/* Rows */}
+          {matrix.map((row, i) => (
+            <React.Fragment key={i}>
+              {showLabels && (
+                <div style={{ fontSize: 9, lineHeight: `${cellSize}px` }}
+                  className="text-zinc-600 text-right pr-1 font-mono">
+                  {i + 1}
+                </div>
+              )}
+              {row.map((val, j) => (
+                <div key={j}
+                  style={{
+                    width: cellSize, height: cellSize,
+                    background: simColor(val),
+                    opacity: activeRow === null ? 1 : (activeRow === i || activeRow === j) ? 1 : 0.25,
+                    outline: activeRow === i && activeRow === j ? '2px solid white' : 'none',
+                    transition: 'opacity 0.15s',
+                  }}
+                  className="rounded-sm cursor-pointer"
+                  onMouseEnter={() => onHover(i)}
+                  onMouseLeave={() => onHover(null)}
+                  onClick={() => onSelect(selected === i ? null : i)}
+                  title={`#${i + 1} vs #${j + 1}: ${val.toFixed(3)}`}
+                />
+              ))}
+            </React.Fragment>
+          ))}
+        </div>
+      </div>
+      {/* Legend */}
+      <div className="flex items-center gap-4 text-xs text-zinc-500 pt-1 border-t border-zinc-800">
+        <span className="flex items-center gap-1.5">
+          <span className="w-3 h-3 rounded-sm inline-block" style={{ background: 'rgba(63,131,248,0.3)' }} /> dissimilar
+        </span>
+        <span className="flex items-center gap-1.5">
+          <span className="w-3 h-3 rounded-sm inline-block" style={{ background: 'rgba(251,191,36,0.7)' }} /> similar
+        </span>
+        <span className="flex items-center gap-1.5">
+          <span className="w-3 h-3 rounded-sm inline-block" style={{ background: 'rgba(239,68,68,0.9)' }} /> very similar
+        </span>
+        <span className="ml-auto text-zinc-600">Click a row to lock · hover to explore</span>
+      </div>
+      {activeRow !== null && (
+        <div className="rounded-lg bg-zinc-800 border border-zinc-700 px-3 py-2 text-xs space-y-1">
+          <p className={`font-mono font-bold ${COLORS[activeRow % COLORS.length].text}`}>Chunk #{activeRow + 1} similarity to all others</p>
+          <div className="flex flex-wrap gap-2 mt-1">
+            {matrix[activeRow].map((val, j) => j !== activeRow && (
+              <span key={j} className="flex items-center gap-1">
+                <span className={`font-mono ${COLORS[j % COLORS.length].text}`}>#{j + 1}</span>
+                <span className="text-zinc-400">{val.toFixed(3)}</span>
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── Vector inspector ──────────────────────────────────────────────────────────
+function VectorInspector({ vector, chunkIndex, chunk }: {
+  vector: number[]; chunkIndex: number; chunk: Chunk
+}) {
+  const SHOW = 64  // show first 64 dimensions — enough to see the pattern
+  const slice = vector.slice(0, SHOW)
+  const maxAbs = Math.max(...slice.map(Math.abs), 0.001)
+
+  return (
+    <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-4 space-y-3">
+      <div className="flex items-center gap-2">
+        <p className="text-xs font-medium text-zinc-400 uppercase tracking-wider">
+          Vector inspector — chunk #{chunkIndex + 1}
+        </p>
+        <InfoTooltip
+          title="What am I looking at?"
+          body={`This is the actual embedding vector for chunk #${chunkIndex + 1} — the list of numbers the model produced.\n\nEach bar = one number (one "dimension"). Positive = bar goes right, negative = bar goes left. The pattern of ups and downs encodes the meaning of the chunk.\n\nNo individual number means anything on its own — it's the whole pattern that matters. Two chunks with similar meaning have similar patterns, which is why they end up close on the scatter plot.\n\nShowing the first ${SHOW} of ${vector.length} dimensions.`}
+          pos="top-right"
+        />
+        <span className="ml-auto text-xs text-zinc-600 font-mono">showing {SHOW} of {vector.length} dims</span>
+      </div>
+      <p className="text-xs text-zinc-500 leading-relaxed line-clamp-2 font-mono">{chunk.page_content.slice(0, 200)}{chunk.page_content.length > 200 ? '…' : ''}</p>
+      {/* Sparkline */}
+      <div className="flex items-center gap-px" style={{ height: 48 }}>
+        {slice.map((v, i) => {
+          const h = Math.round(Math.abs(v) / maxAbs * 20)
+          const pos = v >= 0
+          return (
+            <div key={i} className="flex-1 flex flex-col items-center justify-center" style={{ height: 48 }}>
+              {pos
+                ? <><div className="w-full" style={{ height: 24 }} /><div className={`w-full rounded-t ${COLORS[chunkIndex % COLORS.length].bg}`} style={{ height: h, minHeight: 1 }} /></>
+                : <><div className={`w-full rounded-b ${COLORS[chunkIndex % COLORS.length].bg} opacity-60`} style={{ height: h, minHeight: 1 }} /><div className="w-full" style={{ height: 24 }} /></>}
+            </div>
+          )
+        })}
+      </div>
+      <div className="flex justify-between text-zinc-600" style={{ fontSize: 9 }}>
+        <span>dim 1</span><span>dim {SHOW}</span>
+      </div>
     </div>
   )
 }
