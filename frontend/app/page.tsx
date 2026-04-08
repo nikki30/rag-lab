@@ -51,7 +51,7 @@ interface CompareResult { total: number; avg_size: number; min_size: number; max
 type CompareResponse = Record<Strategy, CompareResult>
 
 type EmbedModelId = 'minilm' | 'bge-small' | 'mpnet' | 'nomic'
-type Reduction = 'pca' | 'umap'
+type Reduction = 'pca' | 'umap' | 'pacmap'
 interface EmbedModel { id: EmbedModelId; label: string; dims: number; speed: string; description: string; tagline: string }
 interface EmbedResult { model: EmbedModelId; dimensions: number; coords_2d: [number, number][]; similarity_matrix: number[][]; vectors: number[][] }
 
@@ -238,7 +238,7 @@ export default function Home() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ chunks: chunks.map(c => c.page_content), model, reduction: red }),
       })
-      if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b?.detail ?? `Error ${res.status}`) }
+      if (!res.ok) { const b = await res.json().catch(() => ({})); const msg = typeof b?.detail === 'string' ? b.detail : JSON.stringify(b?.detail) ?? `Error ${res.status}`; throw new Error(msg) }
       setEmbedResult(await res.json())
       setTimeout(() => embedSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100)
     } catch (e) { setEmbedError(e instanceof Error ? e.message : 'Unknown error') }
@@ -302,6 +302,19 @@ export default function Home() {
       </header>
 
       <main className="max-w-6xl mx-auto px-6 py-8 space-y-6">
+
+        {/* ── Stage 1 header ── */}
+        <div className="flex items-center gap-3">
+          <div className="w-7 h-7 rounded-md bg-violet-600 flex items-center justify-center text-xs font-bold">1</div>
+          <h2 className="text-lg font-semibold tracking-tight">Chunking</h2>
+          <div className="flex items-center gap-1.5 ml-1">
+            <InfoTooltip
+              title="Why chunking is stage 1"
+              body={"Before a document can be searched, it must be split into pieces. Each piece gets turned into a vector (embedding) in stage 2 and stored in an index.\n\nChunking is the most impactful decision in the entire RAG pipeline — more than the embedding model or retrieval algorithm. If a key fact spans a chunk boundary, it might never be retrieved.\n\nThe strategy you pick here directly shapes what the embedding space looks like in stage 2."}
+              pos="top-right"
+            />
+          </div>
+        </div>
 
         {/* ── Strategy picker ── */}
         <div>
@@ -739,17 +752,19 @@ export default function Home() {
                     tooltip={{ title: 'Vector dimensions', body: 'Each chunk is represented by this many numbers. More dimensions = the model can capture finer distinctions between concepts, but uses more memory and is slower to search.\n\nMiniLM and BGE-Small use 384. MPNet and Nomic use 768. In practice the difference is small for a single document.' }} />
                   <StatPill label={`${embedResult.coords_2d.length} vectors`}
                     tooltip={{ title: 'Vectors produced', body: 'One vector per chunk. These are the points you see on the scatter plot below.' }} />
-                  <div className="ml-auto flex items-center gap-1.5 rounded-lg border border-zinc-700 overflow-hidden text-xs">
-                    <span className="px-2 py-1 text-zinc-500">Projection</span>
-                    {(['pca', 'umap'] as Reduction[]).map(r => (
+                  <div className="ml-auto flex items-center gap-2">
+                    <span className="text-xs font-medium text-zinc-500 uppercase tracking-wider">2D Layout</span>
+                    <div className="flex rounded-lg border border-zinc-700 overflow-hidden text-xs">
+                    {(['pca', 'umap', 'pacmap'] as Reduction[]).map(r => (
                       <button key={r} onClick={() => { setReduction(r); handleEmbed(embedModel, r) }}
                         className={`px-3 py-1.5 uppercase font-mono transition-colors ${reduction === r ? 'bg-zinc-700 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300'}`}>
                         {r}
                       </button>
                     ))}
+                    </div>
                     <InfoTooltip
-                      title="PCA vs UMAP — what's the difference?"
-                      body={"Both squash your high-dimensional vectors down to 2D so you can see them.\n\nPCA — fast, deterministic, straight linear math. Sometimes squashes clusters together even when they're truly separate in the full space.\n\nUMAP — smarter layout algorithm, preserves neighbourhood structure better. Much better at revealing genuine clusters. Takes ~2s extra.\n\nTip: start with PCA to understand the shape, switch to UMAP to see if clusters are real."}
+                      title="PCA vs UMAP vs PaCMAP — 2D Layout algorithms"
+                      body={"All three are dimensionality reduction techniques — they take your 384D vectors and find a 2D arrangement that preserves as much structure as possible. Only PCA is a true geometric projection (a shadow). UMAP and PaCMAP are learned layouts — they run an optimisation to find the best 2D positions, so there's no direct geometric shadow being cast.\n\nPCA — only true projection. Fast, deterministic. Honest about global spread but misses curved cluster structure.\n\nUMAP — learned layout. Great at revealing tight clusters. But 'contention points' (chunks mid-way between two topics) get forced into one island arbitrarily. Inter-cluster distances are meaningless.\n\nPaCMAP — learned layout designed to fix both. Balances near, mid-range, and far pairs. Boundary points stay mid-range rather than being forced into an island.\n\nTip: use PaCMAP as your default, PCA to sanity-check global spread, UMAP if you want to see tight cluster structure."}
                       pos="top-left"
                     />
                   </div>
@@ -814,7 +829,7 @@ function EmbedScatterPlot({ coords, chunks, hovered, selected, onHover, onSelect
   return (
     <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-4 space-y-3">
       <div className="flex items-center gap-2">
-        <p className="text-xs font-medium text-zinc-400 uppercase tracking-wider">Vector space — {reduction.toUpperCase()} projection</p>
+        <p className="text-xs font-medium text-zinc-400 uppercase tracking-wider">Vector space — {reduction.toUpperCase()} layout</p>
         <InfoTooltip
           title="How to read the scatter plot"
           body={"Each dot = one chunk. The position comes from squashing your high-dimensional vectors down to 2D.\n\nDots that are close together = chunks with similar meaning. Dots far apart = different topics.\n\nThis is what your retriever sees when searching. A query vector would appear somewhere on this plot — the retriever picks the nearest dots.\n\nClick a dot to inspect its raw vector below. Hover to see the chunk text."}
@@ -886,18 +901,34 @@ function EmbedScatterPlot({ coords, chunks, hovered, selected, onHover, onSelect
 }
 
 // ── Embed heatmap ─────────────────────────────────────────────────────────────
+const ADJACENT_THRESHOLD = 0.75  // off-diagonal similarity this high = likely chunking issue
+const DIAGONAL_DOMINANT_THRESHOLD = 0.5  // avg off-diagonal below this = healthy distinct chunks
+
 function EmbedHeatmap({ matrix, chunks, hovered, selected, onHover, onSelect }: {
   matrix: number[][]; chunks: Chunk[]
   hovered: number | null; selected: number | null
   onHover: (i: number | null) => void; onSelect: (i: number | null) => void
 }) {
   const n = matrix.length
-  // Cell size scales with chunk count — minimum 8px, comfortable up to ~30 chunks
   const cellSize = Math.max(8, Math.min(36, Math.floor(480 / n)))
   const showLabels = cellSize >= 18
 
+  // Detect adjacent-chunk chunking issues: matrix[i][i+1] above threshold
+  const adjacentIssues = new Set<number>() // i means the pair (i, i+1) is flagged
+  for (let i = 0; i < n - 1; i++) {
+    if (matrix[i][i + 1] >= ADJACENT_THRESHOLD) adjacentIssues.add(i)
+  }
+
+  // Detect diagonal-dominant (healthy) pattern:
+  // avg off-diagonal similarity is low, meaning chunks are distinct
+  let offDiagSum = 0, offDiagCount = 0
+  for (let i = 0; i < n; i++)
+    for (let j = 0; j < n; j++)
+      if (i !== j) { offDiagSum += matrix[i][j]; offDiagCount++ }
+  const avgOffDiag = offDiagCount > 0 ? offDiagSum / offDiagCount : 0
+  const isDiagonalDominant = avgOffDiag < DIAGONAL_DOMINANT_THRESHOLD && n >= 3
+
   function simColor(v: number) {
-    // 0 = cool blue/zinc, 1 = hot red/orange
     const t = Math.max(0, Math.min(1, v))
     if (t < 0.4) return `rgba(63,131,248,${0.15 + t * 0.4})`
     if (t < 0.7) return `rgba(251,191,36,${0.3 + (t - 0.4) * 0.9})`
@@ -906,55 +937,107 @@ function EmbedHeatmap({ matrix, chunks, hovered, selected, onHover, onSelect }: 
 
   const activeRow = selected ?? hovered
 
+  // Which rows are part of a flagged adjacent pair
+  const flaggedRows = new Set<number>()
+  adjacentIssues.forEach(i => { flaggedRows.add(i); flaggedRows.add(i + 1) })
+
   return (
     <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-4 space-y-3">
       <div className="flex items-center gap-2">
         <p className="text-xs font-medium text-zinc-400 uppercase tracking-wider">Cosine similarity heatmap</p>
         <InfoTooltip
           title="How to read the heatmap"
-          body={"Each cell shows how similar two chunks are to each other.\n\nRed/orange = very similar (score near 1.0) — the two chunks are about the same topic.\nBlue = dissimilar (score near 0.0) — different topics.\n\nThe diagonal is always red (a chunk is 100% similar to itself).\n\nLook for off-diagonal red blocks — they reveal chunks that are nearly duplicates, which wastes embedding budget. Look for mostly blue rows — that chunk is topically isolated and will be easy to retrieve precisely."}
+          body={"Each cell = cosine similarity between two chunks. Cosine measures the angle between vectors — not their length. This is deliberate: a short chunk and a long chunk about the same topic point in the same direction in 384D space, so they score 1.0 regardless of size. Direction = meaning. Length = irrelevant.\n\nRed/orange = similar direction = same topic.\nBlue = different direction = different topic.\n\nThe diagonal is always 1.0 (a chunk compared to itself).\n\nOff-diagonal red = near-duplicate chunks — same meaning, wasted embedding budget.\nMostly blue row = that chunk is topically isolated — easy to retrieve precisely."}
           pos="top-right"
         />
       </div>
-      <div className="overflow-auto">
-        <div style={{ display: 'grid', gridTemplateColumns: `${showLabels ? 20 : 0}px repeat(${n}, ${cellSize}px)`, gap: 1 }}>
-          {/* Column headers */}
-          {showLabels && <div />}
-          {Array.from({ length: n }, (_, i) => (
-            <div key={i} style={{ width: cellSize, fontSize: 9 }}
-              className="text-zinc-600 text-center overflow-hidden font-mono">
-              {showLabels ? i + 1 : ''}
-            </div>
-          ))}
-          {/* Rows */}
-          {matrix.map((row, i) => (
-            <React.Fragment key={i}>
-              {showLabels && (
-                <div style={{ fontSize: 9, lineHeight: `${cellSize}px` }}
-                  className="text-zinc-600 text-right pr-1 font-mono">
-                  {i + 1}
-                </div>
-              )}
-              {row.map((val, j) => (
-                <div key={j}
-                  style={{
-                    width: cellSize, height: cellSize,
-                    background: simColor(val),
-                    opacity: activeRow === null ? 1 : (activeRow === i || activeRow === j) ? 1 : 0.25,
-                    outline: activeRow === i && activeRow === j ? '2px solid white' : 'none',
-                    transition: 'opacity 0.15s',
-                  }}
-                  className="rounded-sm cursor-pointer"
-                  onMouseEnter={() => onHover(i)}
-                  onMouseLeave={() => onHover(null)}
-                  onClick={() => onSelect(selected === i ? null : i)}
-                  title={`#${i + 1} vs #${j + 1}: ${val.toFixed(3)}`}
-                />
-              ))}
-            </React.Fragment>
-          ))}
+
+      {/* Pattern banners */}
+      {adjacentIssues.size > 0 && (
+        <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2">
+          <span className="text-amber-400 text-sm mt-0.5">⚠</span>
+          <div className="text-xs text-amber-300 space-y-0.5">
+            <p className="font-semibold">Chunking issue detected</p>
+            <p className="text-amber-400/80">
+              {[...adjacentIssues].map(i => `#${i + 1}↔#${i + 2}`).join(', ')} {adjacentIssues.size === 1 ? 'are' : 'pairs are'} very similar ({'>'}
+              {Math.round(ADJACENT_THRESHOLD * 100)}%). Adjacent chunks this close usually means the chunker split mid-thought. Consider semantic chunking or a larger chunk_size.
+            </p>
+          </div>
+          <InfoTooltip
+            title="Why adjacent similarity flags a chunking problem"
+            body={"If chunk #5 and chunk #6 are both very similar to each other AND they are next to each other in the document, it strongly suggests the chunker placed a boundary in the middle of a continuous idea — splitting one thought across two chunks.\n\nThis hurts retrieval because: (1) neither chunk is a complete thought on its own, so they embed weakly. (2) one becomes a 'hub' — similar to its neighbour and potentially to unrelated chunks nearby.\n\nFix: try semantic chunking, which explicitly avoids splitting where sentences are highly similar. Or increase chunk_size so the two pieces stay together."}
+            pos="top-left"
+          />
+        </div>
+      )}
+
+      {isDiagonalDominant && adjacentIssues.size === 0 && (
+        <div className="flex items-start gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2">
+          <span className="text-emerald-400 text-sm mt-0.5">✓</span>
+          <div className="text-xs text-emerald-300 space-y-0.5">
+            <p className="font-semibold">Healthy chunk separation</p>
+            <p className="text-emerald-400/80">
+              Diagonal is red, off-diagonal is mostly blue (avg {avgOffDiag.toFixed(2)}). Each chunk is distinct from the others — good for precise retrieval.
+            </p>
+          </div>
+          <InfoTooltip
+            title="What diagonal-dominant means"
+            body={"The diagonal of the heatmap represents each chunk's similarity to itself — always 1.0, always red.\n\nWhen everything else is blue, it means each chunk is topically distinct from every other chunk. This is the ideal pattern: the retriever can pinpoint exactly which chunk answers a given query, without confusion from near-duplicates.\n\nIt doesn't mean your document has no coherence — it means the chunking preserved meaningful boundaries between ideas."}
+            pos="top-left"
+          />
+        </div>
+      )}
+
+      <div className="overflow-auto flex justify-center">
+        <div style={{ position: 'relative' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: `${showLabels ? 20 : 0}px repeat(${n}, ${cellSize}px)`, gap: 1 }}>
+            {/* Column headers */}
+            {showLabels && <div />}
+            {Array.from({ length: n }, (_, i) => (
+              <div key={i} style={{ width: cellSize, fontSize: 9 }}
+                className={`text-center overflow-hidden font-mono ${flaggedRows.has(i) ? 'text-amber-400' : 'text-zinc-600'}`}>
+                {showLabels ? i + 1 : ''}
+              </div>
+            ))}
+            {/* Rows */}
+            {matrix.map((row, i) => (
+              <React.Fragment key={i}>
+                {showLabels && (
+                  <div style={{ fontSize: 9, lineHeight: `${cellSize}px` }}
+                    className={`text-right pr-1 font-mono ${flaggedRows.has(i) ? 'text-amber-400' : 'text-zinc-600'}`}>
+                    {i + 1}
+                  </div>
+                )}
+                {row.map((val, j) => {
+                  // Is this cell part of an adjacent-issue pair?
+                  const isAdjacentIssue = (i === j + 1 || i + 1 === j) && adjacentIssues.has(Math.min(i, j))
+                  return (
+                    <div key={j}
+                      style={{
+                        width: cellSize, height: cellSize,
+                        background: simColor(val),
+                        opacity: activeRow === null ? 1 : (activeRow === i || activeRow === j) ? 1 : 0.25,
+                        outline: isAdjacentIssue
+                          ? '2px solid rgba(251,191,36,0.9)'
+                          : activeRow === i && activeRow === j ? '2px solid white' : 'none',
+                        transition: 'opacity 0.15s',
+                        zIndex: isAdjacentIssue ? 1 : 0,
+                        position: 'relative',
+                      }}
+                      className="rounded-sm cursor-pointer"
+                      onMouseEnter={() => onHover(i)}
+                      onMouseLeave={() => onHover(null)}
+                      onClick={() => onSelect(selected === i ? null : i)}
+                      title={`#${i + 1} vs #${j + 1}: ${val.toFixed(3)}${isAdjacentIssue ? ' ⚠ adjacent chunks too similar' : ''}`}
+                    />
+                  )
+                })}
+              </React.Fragment>
+            ))}
+          </div>
         </div>
       </div>
+
       {/* Legend */}
       <div className="flex items-center gap-4 text-xs text-zinc-500 pt-1 border-t border-zinc-800">
         <span className="flex items-center gap-1.5">
@@ -966,8 +1049,14 @@ function EmbedHeatmap({ matrix, chunks, hovered, selected, onHover, onSelect }: 
         <span className="flex items-center gap-1.5">
           <span className="w-3 h-3 rounded-sm inline-block" style={{ background: 'rgba(239,68,68,0.9)' }} /> very similar
         </span>
+        {adjacentIssues.size > 0 && (
+          <span className="flex items-center gap-1.5">
+            <span className="w-3 h-3 rounded-sm inline-block border-2 border-amber-400/90" style={{ background: 'rgba(239,68,68,0.9)' }} /> chunking issue
+          </span>
+        )}
         <span className="ml-auto text-zinc-600">Click a row to lock · hover to explore</span>
       </div>
+
       {activeRow !== null && (
         <div className="rounded-lg bg-zinc-800 border border-zinc-700 px-3 py-2 text-xs space-y-1">
           <p className={`font-mono font-bold ${COLORS[activeRow % COLORS.length].text}`}>Chunk #{activeRow + 1} similarity to all others</p>
@@ -975,7 +1064,7 @@ function EmbedHeatmap({ matrix, chunks, hovered, selected, onHover, onSelect }: 
             {matrix[activeRow].map((val, j) => j !== activeRow && (
               <span key={j} className="flex items-center gap-1">
                 <span className={`font-mono ${COLORS[j % COLORS.length].text}`}>#{j + 1}</span>
-                <span className="text-zinc-400">{val.toFixed(3)}</span>
+                <span className={`${adjacentIssues.has(Math.min(activeRow, j)) && Math.abs(activeRow - j) === 1 ? 'text-amber-400 font-semibold' : 'text-zinc-400'}`}>{val.toFixed(3)}</span>
               </span>
             ))}
           </div>
