@@ -247,6 +247,11 @@ EMBED_MODELS: dict[str, str] = {
 # Cache loaded models so we don't reload on every request
 _model_cache: dict[str, object] = {}
 
+# ── Stage 3 state ─────────────────────────────────────────────────────────────
+# Populated by /api/embed, consumed by /api/build-index and /api/query-index
+_embed_store: dict = {"vectors": None, "chunks": None, "model": None, "pca": None}
+_index_store: dict = {"hnsw": None, "hnsw_meta": None, "ivf_km": None, "ivf_assignments": None, "ivf_centroids_2d": None}
+
 def get_model(model_id: EmbedModelId):
     if model_id not in _model_cache:
         from sentence_transformers import SentenceTransformer
@@ -349,6 +354,15 @@ async def embed_chunks(request: EmbedRequest):
         # Cosine similarity matrix (vectors are already L2-normalised → dot product = cosine)
         sim_matrix = (vectors @ vectors.T).tolist()
 
+        # Store for Stage 3 indexing — fit PCA once for projecting query vectors later
+        _embed_store["vectors"] = vectors
+        _embed_store["chunks"] = list(request.chunks)
+        _embed_store["model"] = request.model
+        _embed_store["pca"] = PCA(n_components=2).fit(vectors) if len(request.chunks) >= 2 else None
+        # Reset any stale indices
+        for k in _index_store:
+            _index_store[k] = None
+
         return {
             "model": request.model,
             "dimensions": int(vectors.shape[1]),
@@ -398,3 +412,242 @@ async def compare_strategies(request: ChunkRequest):
             results[strat] = {"error": str(e)}
 
     return results
+
+
+# ── Stage 3: Indexing ─────────────────────────────────────────────────────────
+
+class BuildIndexRequest(BaseModel):
+    M: int = 16
+    ef_construction: int = 100
+    n_clusters: int = 4
+
+
+def _hnsw_neighbors_at(offsets, neighbors_arr, node: int, level: int, node_max_level: int, M: int) -> list[int]:
+    """Return actual graph neighbors of `node` at `level` using the FAISS offsets array.
+
+    FAISS HNSW neighbor layout per node:
+      level 0 → 2*M slots  (cum offset = 0)
+      level 1 → M slots    (cum offset = 2*M)
+      level l → M slots    (cum offset = 2*M + (l-1)*M = (l+1)*M)
+    """
+    if node_max_level < level:
+        return []
+    cum = 0 if level == 0 else (level + 1) * M
+    nb_slots = 2 * M if level == 0 else M
+    begin = int(offsets[node]) + cum
+    end = begin + nb_slots
+    return [int(x) for x in neighbors_arr[begin:end] if x != -1]
+
+
+def _extract_hnsw_graph(index, vectors, M: int) -> dict:
+    """Extract the real HNSW graph from a FAISS IndexHNSWFlat for visualization."""
+    import faiss as faiss_mod
+    n = len(vectors)
+    levels_raw = faiss_mod.vector_to_array(index.hnsw.levels).tolist()
+    offsets = faiss_mod.vector_to_array(index.hnsw.offsets)
+    neighbors_arr = faiss_mod.vector_to_array(index.hnsw.neighbors)
+    max_level = int(index.hnsw.max_level)
+    entry_point = int(index.hnsw.entry_point)
+
+    # levels_raw[i] = number of layers node i participates in (1-indexed)
+    node_levels = [int(l) - 1 for l in levels_raw]  # convert to 0-indexed max level
+
+    layers = []
+    for lv in range(max_level + 1):
+        lv_nodes = [i for i in range(n) if node_levels[i] >= lv]
+        edges: set[tuple] = set()
+        for nd in lv_nodes:
+            for nb in _hnsw_neighbors_at(offsets, neighbors_arr, nd, lv, node_levels[nd], M):
+                if nb != nd:
+                    edges.add((min(nd, nb), max(nd, nb)))
+        layers.append({"level": lv, "nodes": lv_nodes, "edges": [list(e) for e in edges]})
+
+    return {
+        "layers": layers,
+        "node_levels": node_levels,
+        "max_level": max_level,
+        "entry_point": entry_point,
+        "M": M,
+    }
+
+
+def _simulate_traversal(index, vectors: np.ndarray, query_vec: np.ndarray) -> list:
+    """Greedy traversal through the FAISS HNSW graph — records visited nodes per layer."""
+    import faiss as faiss_mod
+    M = int(index.hnsw.M)
+    levels_raw = faiss_mod.vector_to_array(index.hnsw.levels).tolist()
+    offsets = faiss_mod.vector_to_array(index.hnsw.offsets)
+    neighbors_arr = faiss_mod.vector_to_array(index.hnsw.neighbors)
+    node_levels = [int(l) - 1 for l in levels_raw]
+    max_level = int(index.hnsw.max_level)
+    ep = int(index.hnsw.entry_point)
+    traversal = []
+
+    for lv in range(max_level, -1, -1):
+        visited = [ep]
+        current = ep
+        best_sim = float(np.dot(query_vec, vectors[ep]))
+        improved = True
+        while improved:
+            improved = False
+            for nb in _hnsw_neighbors_at(offsets, neighbors_arr, current, lv, node_levels[current], M):
+                if nb == current or nb in visited:
+                    continue
+                visited.append(nb)
+                sim = float(np.dot(query_vec, vectors[nb]))
+                if sim > best_sim:
+                    best_sim = sim
+                    current = nb
+                    improved = True
+                    break  # restart from new best
+        traversal.append({"layer": lv, "visited": [int(v) for v in visited], "best": int(current)})
+        ep = current
+
+    return traversal
+
+
+@app.post("/api/build-index")
+async def build_index(request: BuildIndexRequest):
+    if _embed_store["vectors"] is None:
+        raise HTTPException(status_code=400, detail="No vectors — run /api/embed first")
+
+    vectors = _embed_store["vectors"]
+    n, dim = vectors.shape
+
+    # ── HNSW via FAISS ────────────────────────────────────────────────────────
+    try:
+        import faiss
+        hnsw_idx = faiss.IndexHNSWFlat(dim, request.M)
+        hnsw_idx.hnsw.efConstruction = request.ef_construction
+        hnsw_idx.add(vectors.astype(np.float32))
+        hnsw_meta = _extract_hnsw_graph(hnsw_idx, vectors, request.M)
+        _index_store["hnsw"] = hnsw_idx
+        _index_store["hnsw_meta"] = hnsw_meta
+    except Exception as e:
+        import traceback
+        hnsw_meta = {"error": traceback.format_exc()}
+
+    # ── IVF via sklearn KMeans ────────────────────────────────────────────────
+    from sklearn.cluster import KMeans
+    k = min(request.n_clusters, n)
+    km = KMeans(n_clusters=k, random_state=42, n_init=10)
+    labels = km.fit_predict(vectors).tolist()
+    # Normalize centroids for cosine similarity queries
+    centroids = km.cluster_centers_.copy()
+    centroids /= np.maximum(np.linalg.norm(centroids, axis=1, keepdims=True), 1e-8)
+
+    centroids_2d: list = [[0.0, 0.0]] * k
+    if _embed_store["pca"] is not None:
+        centroids_2d = _embed_store["pca"].transform(centroids).tolist()
+
+    _index_store["ivf_km"] = km
+    _index_store["ivf_assignments"] = labels
+    _index_store["ivf_centroids_2d"] = centroids_2d
+
+    return {
+        "num_vectors": n,
+        "dimensions": dim,
+        "hnsw": hnsw_meta,
+        "ivf": {"cluster_assignments": labels, "n_clusters": k, "centroids_2d": centroids_2d},
+    }
+
+
+class QueryIndexRequest(BaseModel):
+    query: str
+    k: int = 5
+    ef: int = 50
+    nprobe: int = 2
+
+
+@app.post("/api/query-index")
+async def query_index(request: QueryIndexRequest):
+    if _embed_store["vectors"] is None:
+        raise HTTPException(status_code=400, detail="No vectors — build index first")
+
+    vectors = _embed_store["vectors"]
+    chunks = _embed_store["chunks"]
+    model_id = _embed_store["model"]
+    n, dim = vectors.shape
+    k = min(request.k, n)
+
+    # Embed the query (nomic uses search_query: prefix, not search_document:)
+    model = get_model(model_id)
+    prefix = "search_query: " if model_id == "nomic" else ""
+    query_vec: np.ndarray = model.encode([prefix + request.query], normalize_embeddings=True)[0]
+
+    # Project query to 2D using fitted PCA
+    query_2d = [0.0, 0.0]
+    if _embed_store["pca"] is not None:
+        query_2d = _embed_store["pca"].transform(query_vec.reshape(1, -1)).tolist()[0]
+
+    # ── Flat (exact brute-force) ──────────────────────────────────────────────
+    flat_sims = (vectors @ query_vec).tolist()
+    flat_order = sorted(range(n), key=lambda i: -flat_sims[i])[:k]
+    flat_results = [{"idx": i, "sim": round(flat_sims[i], 4), "text": chunks[i]} for i in flat_order]
+    flat_set = {r["idx"] for r in flat_results}
+
+    # ── HNSW ─────────────────────────────────────────────────────────────────
+    hnsw_results = flat_results
+    hnsw_recall = 1.0
+    hnsw_traversal: list = []
+    if _index_store["hnsw"] is not None:
+        try:
+            hnsw_idx = _index_store["hnsw"]
+            hnsw_idx.hnsw.efSearch = max(request.ef, k)
+            _, I = hnsw_idx.search(query_vec.astype(np.float32).reshape(1, -1), k)
+            hnsw_order = [int(i) for i in I[0] if i != -1]
+            hnsw_results = [{"idx": i, "sim": round(float(np.dot(vectors[i], query_vec)), 4), "text": chunks[i]} for i in hnsw_order]
+            hnsw_recall = round(len(flat_set & {r["idx"] for r in hnsw_results}) / len(flat_set), 3) if flat_set else 1.0
+            hnsw_traversal = _simulate_traversal(hnsw_idx, vectors, query_vec)
+        except Exception:
+            pass
+
+    # ── IVF ───────────────────────────────────────────────────────────────────
+    ivf_results = flat_results
+    ivf_recall = 1.0
+    ivf_searched: list[int] = []
+    if _index_store["ivf_km"] is not None:
+        km = _index_store["ivf_km"]
+        centroids = km.cluster_centers_.copy()
+        centroids /= np.maximum(np.linalg.norm(centroids, axis=1, keepdims=True), 1e-8)
+        centroid_sims = (centroids @ query_vec).tolist()
+        nprobe = min(request.nprobe, km.n_clusters)
+        ivf_searched = sorted(range(km.n_clusters), key=lambda i: -centroid_sims[i])[:nprobe]
+        searched_set = set(ivf_searched)
+        assignments = _index_store["ivf_assignments"]
+        candidates = sorted(
+            [(float(np.dot(vectors[i], query_vec)), i) for i, lbl in enumerate(assignments) if lbl in searched_set],
+            reverse=True,
+        )[:k]
+        ivf_results = [{"idx": i, "sim": round(sim, 4), "text": chunks[i]} for sim, i in candidates]
+        ivf_recall = round(len(flat_set & {r["idx"] for r in ivf_results}) / len(flat_set), 3) if flat_set else 1.0
+
+    # ── MRL (Nomic only — Matryoshka truncation) ──────────────────────────────
+    mrl = None
+    if model_id == "nomic":
+        mrl_dims_list = [768, 512, 256, 128, 64]
+        mrl_results: dict = {}
+        mrl_recall: dict = {}
+        for d in mrl_dims_list:
+            d = min(d, dim)
+            tv = vectors[:, :d].copy()
+            tv /= np.maximum(np.linalg.norm(tv, axis=1, keepdims=True), 1e-8)
+            qv = query_vec[:d].copy()
+            qv /= max(float(np.linalg.norm(qv)), 1e-8)
+            sims = (tv @ qv).tolist()
+            ranked = sorted(range(n), key=lambda i: -sims[i])[:k]
+            mrl_results[str(d)] = [{"idx": i, "sim": round(sims[i], 4)} for i in ranked]
+            mrl_recall[str(d)] = round(len(flat_set & {r["idx"] for r in mrl_results[str(d)]}) / len(flat_set), 3) if flat_set else 1.0
+        mrl = {"results_by_dims": mrl_results, "recall": mrl_recall}
+
+    return {
+        "query_2d": query_2d,
+        "flat_results": flat_results,
+        "hnsw_results": hnsw_results,
+        "hnsw_recall": hnsw_recall,
+        "hnsw_traversal": hnsw_traversal,
+        "ivf_results": ivf_results,
+        "ivf_recall": ivf_recall,
+        "ivf_searched_clusters": ivf_searched,
+        "mrl": mrl,
+    }

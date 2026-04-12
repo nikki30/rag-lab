@@ -55,6 +55,27 @@ type Reduction = 'pca' | 'umap' | 'pacmap'
 interface EmbedModel { id: EmbedModelId; label: string; dims: number; speed: string; description: string; tagline: string }
 interface EmbedResult { model: EmbedModelId; dimensions: number; coords_2d: [number, number][]; similarity_matrix: number[][]; vectors: number[][] }
 
+// ── Stage 3 types ─────────────────────────────────────────────────────────────
+type IndexTab = 'flat' | 'hnsw' | 'ivf' | 'mrl'
+interface IndexResult { idx: number; sim: number; text: string }
+interface HNSWLayer { level: number; nodes: number[]; edges: [number, number][] }
+interface HNSWMeta { layers: HNSWLayer[]; node_levels: number[]; max_level: number; entry_point: number; M: number }
+interface IVFData { cluster_assignments: number[]; n_clusters: number; centroids_2d: [number, number][] }
+interface BuildIndexResponse { num_vectors: number; dimensions: number; hnsw: HNSWMeta; ivf: IVFData }
+interface TraversalStep { layer: number; visited: number[]; best: number }
+interface MRLData { results_by_dims: Record<string, { idx: number; sim: number }[]>; recall: Record<string, number> }
+interface QueryIndexResponse {
+  query_2d: [number, number]
+  flat_results: IndexResult[]
+  hnsw_results: IndexResult[]
+  hnsw_recall: number
+  hnsw_traversal: TraversalStep[]
+  ivf_results: IndexResult[]
+  ivf_recall: number
+  ivf_searched_clusters: number[]
+  mrl: MRLData | null
+}
+
 const EMBED_MODELS: EmbedModel[] = [
   { id: 'minilm',    label: 'MiniLM-L6',       dims: 384, speed: 'Fast',    tagline: 'Industry default',       description: 'The workhorse of local RAG. Small, fast, surprisingly good. 384 numbers per chunk. Best starting point.' },
   { id: 'bge-small', label: 'BGE-Small',        dims: 384, speed: 'Fast',    tagline: 'State-of-the-art small', description: 'BAAI\'s model beats MiniLM on retrieval benchmarks at the same size. Same speed, better recall. Current SOTA at 384d.' },
@@ -74,17 +95,14 @@ function InfoTooltip({ title, body, pos = 'top' }: {
     setAnchor({ x: r.left + r.width / 2, y: r.top })
   }
 
-  const tooltipStyle: React.CSSProperties = anchor ? {
-    position: 'fixed',
-    top: anchor.y - 8,
-    left: pos === 'top-left'  ? anchor.x + 8  :
-          pos === 'top-right' ? anchor.x - 8  :
-          anchor.x,
-    transform: pos === 'top-left'  ? 'translate(-100%, -100%)' :
-               pos === 'top-right' ? 'translate(0, -100%)'     :
-               'translate(-50%, -100%)',
-    zIndex: 9999,
-  } : {}
+  const TIP_W = 384 // matches w-96
+  const tooltipStyle: React.CSSProperties = anchor ? (() => {
+    const rawLeft = pos === 'top-left'  ? anchor.x + 8 - TIP_W :
+                    pos === 'top-right' ? anchor.x - 8          :
+                    anchor.x - TIP_W / 2
+    const clampedLeft = Math.min(Math.max(rawLeft, 8), window.innerWidth - TIP_W - 8)
+    return { position: 'fixed', top: anchor.y - 8, left: clampedLeft, transform: 'translateY(-100%)', zIndex: 9999 }
+  })() : {}
 
   return (
     <div className="relative inline-flex shrink-0"
@@ -93,7 +111,7 @@ function InfoTooltip({ title, body, pos = 'top' }: {
     >
       <span className="w-4 h-4 rounded-full border border-zinc-700 text-zinc-600 hover:text-zinc-300 hover:border-zinc-500 text-[10px] flex items-center justify-center transition-colors cursor-help select-none">?</span>
       {anchor && (
-        <div style={tooltipStyle} className="w-72 rounded-xl bg-zinc-800 border border-zinc-700 p-3.5 pointer-events-none shadow-2xl">
+        <div style={tooltipStyle} className="w-96 rounded-xl bg-zinc-800 border border-zinc-700 p-3.5 pointer-events-none shadow-2xl">
           <p className="font-semibold text-zinc-100 mb-1.5 text-xs">{title}</p>
           <p className="text-zinc-400 leading-relaxed text-xs whitespace-pre-line">{body}</p>
         </div>
@@ -210,6 +228,7 @@ export default function Home() {
 
   // ── Embedding stage ──
   const [embedModel, setEmbedModel] = useState<EmbedModelId>('minilm')
+
   const [reduction, setReduction] = useState<Reduction>('pca')
   const [embedResult, setEmbedResult] = useState<EmbedResult | null>(null)
   const [embedLoading, setEmbedLoading] = useState(false)
@@ -218,6 +237,25 @@ export default function Home() {
   const [hoveredEmbedChunk, setHoveredEmbedChunk] = useState<number | null>(null)
   const [selectedEmbedChunk, setSelectedEmbedChunk] = useState<number | null>(null)
   const embedSectionRef = useRef<HTMLDivElement>(null)
+
+  // ── Indexing stage ──
+  const [indexData, setIndexData] = useState<BuildIndexResponse | null>(null)
+  const [indexLoading, setIndexLoading] = useState(false)
+  const [indexError, setIndexError] = useState<string | null>(null)
+  const [indexTab, setIndexTab] = useState<IndexTab>('flat')
+  const [indexM, setIndexM] = useState(16)
+  const [indexEf, setIndexEf] = useState(100)
+  const [indexNClusters, setIndexNClusters] = useState(4)
+  const [queryText, setQueryText] = useState('')
+  const [queryResults, setQueryResults] = useState<QueryIndexResponse | null>(null)
+  const [queryLoading, setQueryLoading] = useState(false)
+  const [queryError, setQueryError] = useState<string | null>(null)
+  const [nprobe, setNprobe] = useState(2)
+  const [hnswEfSearch, setHnswEfSearch] = useState(50)
+  const [activeLayer, setActiveLayer] = useState(0)
+  const [mrlDims, setMrlDims] = useState(768)
+  const [traversalStep, setTraversalStep] = useState(-1)
+  const indexSectionRef = useRef<HTMLDivElement>(null)
 
   const overlapError = strategy !== 'semantic' && chunkOverlap >= chunkSize
     ? 'Overlap must be less than chunk size' : null
@@ -263,6 +301,39 @@ export default function Home() {
     finally { setLoading(false) }
   }
 
+  async function handleBuildIndex() {
+    setIndexLoading(true); setIndexError(null); setQueryResults(null); setTraversalStep(-1)
+    try {
+      const res = await fetch('http://localhost:8000/api/build-index', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ M: indexM, ef_construction: indexEf, n_clusters: indexNClusters }),
+      })
+      if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b?.detail ?? `Error ${res.status}`) }
+      const data: BuildIndexResponse = await res.json()
+      setIndexData(data)
+      setActiveLayer(0)
+      setIndexTab('flat')
+      setTimeout(() => indexSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100)
+    } catch (e) { setIndexError(e instanceof Error ? e.message : 'Unknown error') }
+    finally { setIndexLoading(false) }
+  }
+
+  async function handleQueryIndex() {
+    if (!queryText.trim()) return
+    setQueryLoading(true); setQueryError(null); setTraversalStep(-1)
+    try {
+      const res = await fetch('http://localhost:8000/api/query-index', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: queryText, k: 5, ef: hnswEfSearch, nprobe }),
+      })
+      if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b?.detail ?? `Error ${res.status}`) }
+      setQueryResults(await res.json())
+    } catch (e) { setQueryError(e instanceof Error ? e.message : 'Unknown error') }
+    finally { setQueryLoading(false) }
+  }
+
   async function handleCompare() {
     setCompareLoading(true); setError(null); setCompareData(null)
     try {
@@ -297,7 +368,7 @@ export default function Home() {
         <div className="max-w-6xl mx-auto flex items-center gap-3">
           <div className="w-7 h-7 rounded-md bg-violet-600 flex items-center justify-center text-xs font-bold">R</div>
           <h1 className="text-lg font-semibold tracking-tight">RAG Lab</h1>
-          <span className="ml-2 text-xs text-zinc-500 bg-zinc-800 px-2 py-0.5 rounded-full">chunker → embedder</span>
+          <span className="ml-2 text-xs text-zinc-500 bg-zinc-800 px-2 py-0.5 rounded-full">chunk → embed → index</span>
         </div>
       </header>
 
@@ -744,6 +815,28 @@ export default function Home() {
             )}
 
             {embedResult && !embedLoading && (
+              <div className={`flex items-center gap-4 rounded-xl border px-5 py-4 ${embedStale ? 'border-amber-700/40 bg-amber-950/20' : 'border-zinc-800 bg-zinc-900/60'}`}>
+                <div className="flex-1">
+                  <p className="text-sm font-semibold text-zinc-200">
+                    {embedStale ? 'Re-embed before indexing' : 'Ready to index'}
+                  </p>
+                  <p className="text-xs text-zinc-500 mt-0.5">
+                    {embedStale
+                      ? 'Your chunks changed — re-embed first so the index reflects the current vectors.'
+                      : indexData
+                        ? 'Index is built. Adjust parameters and use the Rebuild Index button in Stage 3 below.'
+                        : `Build a searchable index from your ${embedResult.coords_2d.length} vectors so you can run queries against them.`}
+                  </p>
+                </div>
+                {indexError && <p className="text-xs text-red-400 max-w-xs">{indexError}</p>}
+                <button onClick={handleBuildIndex} disabled={indexLoading || embedStale}
+                  className="px-5 py-2 rounded-lg text-sm font-semibold transition-colors disabled:opacity-40 disabled:cursor-not-allowed bg-amber-600 hover:bg-amber-500 text-white whitespace-nowrap">
+                  {indexLoading ? 'Building…' : indexData ? 'Rebuild Index' : 'Build Index →'}
+                </button>
+              </div>
+            )}
+
+            {embedResult && !embedLoading && (
               <div className="space-y-6">
 
                 {/* Stats bar */}
@@ -801,6 +894,411 @@ export default function Home() {
                 )}
               </div>
             )}
+          </main>
+        </div>
+      )}
+
+      {/* ══════════════════════════════════════════════════════════════════════
+          STAGE 3 — INDEXING
+      ══════════════════════════════════════════════════════════════════════ */}
+      {indexData && (
+        <div ref={indexSectionRef} className="border-t-2 border-zinc-800 mt-2">
+          <main className="max-w-6xl mx-auto px-6 py-8 space-y-6">
+
+            {/* Stage header */}
+            <div className="flex items-center gap-3">
+              <div className="w-7 h-7 rounded-md bg-amber-600 flex items-center justify-center text-xs font-bold">3</div>
+              <h2 className="text-lg font-semibold tracking-tight">Indexing</h2>
+              <div className="flex items-center gap-1.5 ml-1">
+                <InfoTooltip
+                  title="What is an index?"
+                  body={"After embedding, you have a list of vectors — but searching them by computing similarity to every single one is O(n). For millions of documents, that's too slow.\n\nAn index is a data structure built from those vectors that makes search fast. Different index types make different tradeoffs between speed, recall, and memory.\n\nThis stage lets you build and query three types — Flat (exact), HNSW (graph-based approximate), and IVF (cluster-based approximate) — and see exactly what each one does differently."}
+                  pos="top-right"
+                />
+              </div>
+              <span className="ml-auto text-xs text-zinc-600 font-mono">{indexData.num_vectors} vectors · {indexData.dimensions}d</span>
+            </div>
+
+            {/* Query input */}
+            <div className="flex gap-3">
+              <input
+                value={queryText}
+                onChange={e => setQueryText(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && handleQueryIndex()}
+                placeholder="Type a query — e.g. 'How does retrieval work?'"
+                className="flex-1 rounded-xl bg-zinc-900 border border-zinc-700 px-4 py-2.5 text-sm text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-2 focus:ring-amber-600"
+              />
+              <button onClick={handleQueryIndex} disabled={queryLoading || !queryText.trim()}
+                className="px-5 py-2.5 rounded-xl bg-amber-600 hover:bg-amber-500 disabled:opacity-40 text-sm font-semibold transition-colors whitespace-nowrap">
+                {queryLoading ? 'Searching…' : 'Search →'}
+              </button>
+            </div>
+            {queryError && <div className="rounded-xl border border-red-800 bg-red-950/40 px-4 py-3 text-sm text-red-400">{queryError}</div>}
+
+            {/* Build parameters — always visible, above tabs */}
+            <div className="rounded-xl bg-zinc-900 border border-orange-500/30 p-4 space-y-4">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <div className="w-1 h-4 rounded-full bg-orange-500/60" />
+                  <p className="text-xs font-medium text-orange-400 uppercase tracking-wider">Index build parameters</p>
+                  <span className="rounded px-1.5 py-0.5 text-[10px] font-semibold bg-orange-500/10 text-orange-400/80 border border-orange-500/20">change → click Rebuild Index</span>
+                  <InfoTooltip
+                    title="Build vs query parameters"
+                    body={"These are build-time parameters — they shape how the index itself is constructed from your vectors. Changing any of them requires clicking Rebuild Index.\n\n• M — how many edges per chunk in the HNSW graph\n• ef_construction — how carefully HNSW picks those edges\n• n_clusters — how many IVF partitions to create\n\nQuery-time parameters (ef_search in HNSW tab, nprobe in IVF tab) only affect how each search runs. You can change those and just re-run the query — no rebuild needed."}
+                    pos="top-right"
+                  />
+                </div>
+                <button onClick={handleBuildIndex} disabled={indexLoading}
+                  className="px-4 py-1.5 rounded-lg bg-orange-600 hover:bg-orange-500 disabled:opacity-40 text-xs font-semibold transition-colors whitespace-nowrap text-white">
+                  {indexLoading ? 'Building…' : 'Rebuild Index'}
+                </button>
+              </div>
+              <div className="grid grid-cols-3 gap-4">
+                <SliderControl label="M — edges per chunk" value={indexM} min={4} max={32} step={2}
+                  onChange={v => setIndexM(v)} hint="→ click Rebuild Index to apply"
+                  tooltip={{ title: 'M — connections per chunk', body: 'A "node" in HNSW is simply one of your chunks. Every chunk is a point in the graph.\n\nM controls how many other chunks each chunk connects to. When chunk #5 is added to the graph, it links to its M nearest neighbours — those edges persist forever in the index.\n\nM=4 → each chunk has 4 neighbours → sparse graph, fast build, lower recall.\nM=16 → each chunk has 16 neighbours → richer graph, better recall.\nM=32 → very dense graph → excellent recall, uses more memory.\n\nYou can see these edges drawn on the HNSW scatter plot. Try reducing M to 4 and rebuilding — the graph visibly thins out.' }} />
+                <SliderControl label="ef_construction" value={indexEf} min={50} max={400} step={50}
+                  onChange={v => setIndexEf(v)} hint="→ click Rebuild Index to apply"
+                  tooltip={{ title: 'ef_construction — how carefully HNSW finds neighbours at build time', body: 'When a new chunk is added to the graph, HNSW must find its M nearest neighbours to connect to. It does this by running a greedy beam search — exploring candidate nodes and keeping a list of the best ones seen so far.\n\nef_construction is the size of that candidate list.\n\nLow ef (e.g. 50): the beam is narrow. It explores fewer candidates → finds approximate neighbours quickly → done fast, but some nodes end up connected to sub-optimal neighbours.\n\nHigh ef (e.g. 400): wider beam → explores more of the graph → finds truer nearest neighbours for each node → better-quality graph, but every single node insertion takes longer.\n\nThe impact: a graph built with ef=400 will have more accurate edges than ef=50, so searches at query time achieve higher recall even with the same ef_search.\n\nThis parameter has zero effect on query speed — only on build quality.' }} />
+                <SliderControl label="n_clusters" value={indexNClusters} min={2} max={Math.min(10, indexData.num_vectors)} step={1}
+                  onChange={v => setIndexNClusters(v)} hint="→ click Rebuild Index to apply"
+                  tooltip={{ title: 'n_clusters — IVF partitions', body: 'How many groups to partition your vectors into using k-means.\n\nImagine sorting books into n_clusters shelves by topic. At query time, you only look at the 1–2 most relevant shelves instead of every book.\n\nMore clusters → smaller, tighter groups → higher precision at low nprobe, but centroids become less representative.\nFewer clusters → broader groups → safer but less selective.\n\nRule of thumb: √(number of vectors). For our demo size, 3–6 is plenty. Production IVF indexes often have tens of thousands of clusters.' }} />
+              </div>
+            </div>
+
+            {/* Tab bar */}
+            <div className="flex items-center gap-1 rounded-xl bg-zinc-900 border border-zinc-800 p-1 w-fit">
+              {(['flat', 'hnsw', 'ivf', ...(embedModel === 'nomic' ? ['mrl'] : [])] as IndexTab[]).map(tab => (
+                <button key={tab} onClick={() => setIndexTab(tab)}
+                  className={`px-4 py-1.5 rounded-lg text-sm font-semibold transition-colors uppercase tracking-wide ${indexTab === tab ? 'bg-amber-600 text-white' : 'text-zinc-500 hover:text-zinc-300'}`}>
+                  {tab === 'mrl' ? 'MRL ✦' : tab}
+                </button>
+              ))}
+            </div>
+
+            {/* ── FLAT TAB ── */}
+            {indexTab === 'flat' && (
+              <div className="space-y-4">
+                <div className="flex items-center gap-2">
+                  <p className="text-xs font-medium text-zinc-500 uppercase tracking-wider">Flat — exact brute-force search</p>
+                  <InfoTooltip
+                    title="Flat / brute-force search"
+                    body={"The simplest possible approach: compute cosine similarity between the query and every single vector, sort, return top-k. No data structure, no skipping — pure math.\n\nBecause it skips nothing, it doesn't need FAISS or any special index. We just use numpy dot products directly.\n\nThis is the ground truth — 100% recall by definition. Every other index type is measured against it.\n\nThe cost scales as (number of vectors) × (dimensions per vector) per query. For 1M vectors at 768 dimensions that's 768 million multiply-adds — roughly 100–500ms on a laptop CPU. Fine here with a handful of chunks; unusable at production scale.\n\nHNSW and IVF exist entirely to avoid this full scan."}
+                    pos="top-right"
+                  />
+                  <div className="ml-auto flex items-center gap-2 text-xs text-zinc-600">
+                    <span className="text-emerald-400 font-semibold">100% recall</span>
+                    <span>·</span>
+                    <span>O(vectors × dims) per query</span>
+                  </div>
+                </div>
+                {queryResults ? (
+                  <IndexScatterPlot
+                    coords={embedResult!.coords_2d}
+                    chunks={chunks}
+                    queryPoint={queryResults.query_2d}
+                    highlightedIndices={queryResults.flat_results.map(r => r.idx)}
+                    clusterAssignments={null}
+                    centroids2d={null}
+                    searchedClusters={null}
+                    hnswMeta={null}
+                    activeLayer={0}
+                    traversal={null}
+                    traversalStep={-1}
+                    tab="flat"
+                  />
+                ) : (
+                  <div className="rounded-xl bg-zinc-900 border border-zinc-800 px-5 py-10 text-center text-sm text-zinc-600">Enter a query above to see results plotted here</div>
+                )}
+                {queryResults && <IndexResultsList results={queryResults.flat_results} label="Flat results — ranked by cosine similarity" color="amber" />}
+              </div>
+            )}
+
+            {/* ── HNSW TAB ── */}
+            {indexTab === 'hnsw' && (
+              <div className="space-y-4">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <p className="text-xs font-medium text-zinc-500 uppercase tracking-wider">HNSW — hierarchical navigable small world <span className="text-zinc-600 normal-case font-normal">(Facebook AI Similarity Search)</span></p>
+                  <InfoTooltip
+                    title="How HNSW works (FAISS IndexHNSWFlat)"
+                    body={"FAISS (Facebook AI Similarity Search — Meta Research) is the library that builds and searches the index. Without FAISS, every query would fall back to flat search.\n\nHNSW is the data structure FAISS builds: a multilayer graph where each chunk connects to M neighbours. The graph is what lets FAISS skip most cosine comparisons — instead of comparing the query to every chunk, it navigates the graph layer by layer to reach the right neighbourhood.\n\nThe similarity metric is still cosine throughout — HNSW just determines which chunks you ever bother comparing against.\n\nUpper layers (highway): sparse, random subset of chunks — used for fast long-range navigation.\nLayer 0 (precise): all chunks — used for the final local search.\n\nResult: near-perfect recall while computing cosine similarity against only a tiny fraction of all vectors."}
+                    pos="top-right"
+                  />
+                  {queryResults && (
+                    <div className={`ml-auto flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-semibold ${queryResults.hnsw_recall === 1 ? 'bg-emerald-500/20 text-emerald-400' : 'bg-amber-500/20 text-amber-400'}`}>
+                      {Math.round(queryResults.hnsw_recall * 100)}% recall vs flat
+                      <InfoTooltip title="HNSW recall" body={"How many of the true top-5 (from flat search) HNSW also found.\n\n100% = perfect — HNSW found exactly the same results as brute force.\n<100% = HNSW missed some true nearest neighbours — the cost of approximation.\n\nIncrease ef (search beam width) to improve recall at the cost of speed."} pos="top-left" />
+                    </div>
+                  )}
+                </div>
+
+                {/* Layer selector — only if HNSW built successfully */}
+                {'layers' in indexData.hnsw ? (
+                <div className="flex items-center gap-3">
+                  <span className="text-xs text-zinc-500">Layer:</span>
+                  <div className="flex rounded-lg border border-zinc-700 overflow-hidden text-xs">
+                    {[...(indexData.hnsw as HNSWMeta).layers].reverse().map(l => (
+                      <button key={l.level} onClick={() => setActiveLayer(l.level)}
+                        className={`px-3 py-1.5 transition-colors ${activeLayer === l.level ? 'bg-zinc-700 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300'}`}>
+                        {l.level === 0 ? '0 — all chunks (precise)' : `${l.level} — highway (coarse)`}
+                        <span className="ml-1.5 text-zinc-600">{l.nodes.length} chunks</span>
+                      </button>
+                    ))}
+                  </div>
+                  <InfoTooltip
+                    title="HNSW layers"
+                    body={"HNSW search starts at the highest layer and descends to layer 0.\n\nHigher layers (highway): only a random subset of chunks exist here — roughly 1/M of all chunks. They have long-range connections spanning the space, so the search can skip large distances quickly.\n\nLayer 0 (precise): every chunk exists here with 2×M connections each. This is where the final nearest-neighbour search happens.\n\nThe chunk count shown on each button is how many chunks exist at that layer. The top-5 results shown on the scatter plot may include chunks from any layer — that's why you might see 5 highlighted but only 3 chunks at layer 1."}
+                  />
+                  <div className="ml-auto flex items-center gap-3 text-xs text-zinc-600">
+                    <span>M = {(indexData.hnsw as HNSWMeta).M}</span>
+                    <span>·</span>
+                    <span className="flex items-center gap-1">
+                      entry = chunk #{(indexData.hnsw as HNSWMeta).entry_point + 1}
+                      <InfoTooltip title="Entry point" body={"The entry point is the last chunk inserted into the index — effectively arbitrary from the data's perspective. Every search starts here regardless of the query.\n\nIn a well-connected graph this doesn't matter much — the highway layers navigate away from it quickly. But in a poorly-connected graph (low M, low ef_construction), a bad entry point can hurt recall."} />
+                    </span>
+                  </div>
+                </div>
+                ) : (
+                  <div className="rounded-lg border border-red-800 bg-red-950/40 px-4 py-3 text-sm text-red-400">
+                    HNSW failed to build: {(indexData.hnsw as {error: string}).error} — try rebuilding.
+                  </div>
+                )}
+
+                {'layers' in indexData.hnsw && (
+                <IndexScatterPlot
+                  coords={embedResult!.coords_2d}
+                  chunks={chunks}
+                  queryPoint={queryResults?.query_2d ?? null}
+                  highlightedIndices={queryResults?.hnsw_results.map(r => r.idx) ?? []}
+                  clusterAssignments={null}
+                  centroids2d={null}
+                  searchedClusters={null}
+                  hnswMeta={indexData.hnsw as HNSWMeta}
+                  activeLayer={activeLayer}
+                  traversal={queryResults?.hnsw_traversal ?? null}
+                  traversalStep={traversalStep}
+                  tab="hnsw"
+                />
+                )}
+
+                {/* Traversal stepper */}
+                {queryResults?.hnsw_traversal && queryResults.hnsw_traversal.length > 0 && (
+                  <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-4 space-y-3">
+                    <div className="flex items-center gap-2">
+                      <p className="text-xs font-medium text-zinc-400 uppercase tracking-wider">Query traversal</p>
+                      <InfoTooltip
+                        title="How to read the traversal"
+                        body={"Each row = one layer of the HNSW graph. The search starts at the entry point on the highest layer and descends.\n\nVisited nodes = every node the greedy search touched at that layer.\nBest = the node it landed on before dropping to the next layer.\n\nNotice that upper layers visit very few nodes (fast coarse navigation) while layer 0 visits more (precise local search)."}
+                        pos="top-right"
+                      />
+                    </div>
+                    <div className="space-y-0">
+                      {[...queryResults.hnsw_traversal].reverse().map((step, i, arr) => {
+                        const isLast = i === arr.length - 1
+                        const nextStep = arr[i + 1]
+                        return (
+                          <div key={step.layer}>
+                            <div className="flex items-start gap-3 text-xs py-2">
+                              <div className="w-32 shrink-0">
+                                <span className="text-zinc-400 font-semibold">Layer {step.layer}</span>
+                                <span className="ml-1.5 text-zinc-600">{step.layer === 0 ? '(precise)' : '(highway)'}</span>
+                              </div>
+                              <div className="flex flex-wrap gap-1 flex-1">
+                                {step.visited.map(v => (
+                                  <span key={v} className={`rounded px-1.5 py-0.5 font-mono ${v === step.best ? 'bg-amber-500/30 text-amber-300 font-bold ring-1 ring-amber-500/50' : 'bg-zinc-800 text-zinc-400'}`}>
+                                    #{v + 1}
+                                  </span>
+                                ))}
+                              </div>
+                              <span className="text-zinc-600 shrink-0">{step.visited.length} visited</span>
+                            </div>
+                            {!isLast && (
+                              <div className="flex items-center gap-2 text-xs pl-32 py-1 text-zinc-600 border-l border-zinc-800 ml-3">
+                                <span className="text-amber-500/70">↓</span>
+                                <span>landed on chunk #{step.best + 1} — use as entry point for layer {nextStep.layer}</span>
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })}
+                    </div>
+                    <p className="text-xs text-zinc-600 pt-1 border-t border-zinc-800">Gold chip = best chunk at that layer · each layer's winner becomes the starting point for the layer below</p>
+                  </div>
+                )}
+
+                {/* Query-time param only */}
+                <div className="rounded-xl bg-zinc-900 border border-emerald-500/25 p-4 space-y-3 max-w-xs">
+                  <div className="flex items-center gap-2">
+                    <div className="w-1 h-4 rounded-full bg-emerald-500/60" />
+                    <p className="text-xs font-medium text-emerald-400 uppercase tracking-wider">Query parameter</p>
+                    <span className="rounded px-1.5 py-0.5 text-[10px] font-semibold bg-emerald-500/10 text-emerald-400/80 border border-emerald-500/20">change → re-run Search</span>
+                  </div>
+                  <SliderControl label="ef_search — beam width" value={hnswEfSearch} min={10} max={200} step={10}
+                    onChange={v => setHnswEfSearch(v)} hint="→ re-run Search to apply"
+                    tooltip={{ title: 'ef_search — query-time beam width', body: 'How many candidates the search considers at layer 0 before returning top-k results.\n\nHigher ef → better recall (finds true nearest neighbours more reliably), slower query.\nLower ef → faster query, may miss some true nearest neighbours.\n\nWhen ef ≈ k, recall can drop. When ef >> k, recall ≈ 100%.\n\nThis is a query-only parameter — changing it does not require rebuilding the index.' }} />
+                </div>
+
+                {queryResults && <IndexResultsList results={queryResults.hnsw_results} label="HNSW results" color="amber" />}
+              </div>
+            )}
+
+            {/* ── IVF TAB ── */}
+            {indexTab === 'ivf' && (
+              <div className="space-y-4">
+                <div className="flex items-center gap-2">
+                  <p className="text-xs font-medium text-zinc-500 uppercase tracking-wider">IVF — inverted file index <span className="text-zinc-600 normal-case font-normal">(Facebook AI Similarity Search)</span></p>
+                  <InfoTooltip
+                    title="How IVF works (FAISS IndexIVFFlat)"
+                    body={"FAISS (Facebook AI Similarity Search — Meta Research) builds and searches the IVF index in production. In this demo we use sklearn for the clustering step, but the concept is identical.\n\nIVF is the data structure: a set of clusters that lets FAISS skip cosine comparisons against most vectors. The similarity metric is still cosine throughout — IVF just controls which vectors you ever compare against.\n\n① BUILD — k-means clusters your vectors into n_clusters groups. Each cluster gets a centroid — a computed average position, NOT one of your original vectors. The × markers you see are these averages.\n\nHow centroids are found (k-means++):\n• Pick a first centroid from your data points at random\n• Each subsequent seed is chosen with probability proportional to its distance from the nearest existing centroid\n• Assign every vector to its nearest centroid → move each centroid to the mean of its members → repeat until stable\n\n② QUERY — use cosine to find the nprobe nearest centroids, then use cosine to search only the vectors inside those clusters. Everything else is skipped.\n\nTrade-off: nprobe=1 → fastest, may miss true neighbours. nprobe=n_clusters → 100% recall, same as flat."}
+                    pos="top-right"
+                  />
+                  {queryResults && (
+                    <div className={`ml-auto flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-semibold ${queryResults.ivf_recall === 1 ? 'bg-emerald-500/20 text-emerald-400' : 'bg-amber-500/20 text-amber-400'}`}>
+                      {Math.round(queryResults.ivf_recall * 100)}% recall
+                      <InfoTooltip title="IVF recall" body={"How many of the true top-5 (flat) IVF found by only searching nprobe clusters.\n\nIncrease nprobe to search more clusters → higher recall but slower.\nnprobe = n_clusters → same as flat search (100% recall)."} pos="top-left" />
+                    </div>
+                  )}
+                </div>
+
+                <IndexScatterPlot
+                  coords={embedResult!.coords_2d}
+                  chunks={chunks}
+                  queryPoint={queryResults?.query_2d ?? null}
+                  highlightedIndices={queryResults?.ivf_results.map(r => r.idx) ?? []}
+                  clusterAssignments={indexData.ivf.cluster_assignments}
+                  centroids2d={indexData.ivf.centroids_2d}
+                  searchedClusters={queryResults?.ivf_searched_clusters ?? null}
+                  hnswMeta={null}
+                  activeLayer={0}
+                  traversal={null}
+                  traversalStep={-1}
+                  tab="ivf"
+                />
+
+                {/* Query-time param — n_clusters is in the shared build params panel above */}
+                <div className="rounded-xl bg-zinc-900 border border-emerald-500/25 p-4 space-y-3 max-w-xs">
+                  <div className="flex items-center gap-2">
+                    <div className="w-1 h-4 rounded-full bg-emerald-500/60" />
+                    <p className="text-xs font-medium text-emerald-400 uppercase tracking-wider">Query parameter</p>
+                    <span className="rounded px-1.5 py-0.5 text-[10px] font-semibold bg-emerald-500/10 text-emerald-400/80 border border-emerald-500/20">change → re-run Search</span>
+                  </div>
+                  <SliderControl label="nprobe — clusters to search" value={nprobe} min={1} max={indexData.ivf.n_clusters} step={1}
+                    onChange={v => setNprobe(v)} hint="→ re-run Search to apply"
+                    tooltip={{ title: 'nprobe — query-only, no rebuild needed', body: `How many of the ${indexData.ivf.n_clusters} clusters to search per query.\n\nnprobe=1 → fastest, lowest recall — only the single nearest cluster is searched.\nnprobe=${indexData.ivf.n_clusters} → same recall as flat search, 100%.\n\nProduction IVF indexes have thousands of clusters with nprobe ≈ 20 — searching only ~2% of the index.\n\nThis is a query-only parameter. The clusters themselves don't change — you're just deciding how many to look at each time you search.` }} />
+                </div>
+
+                {queryResults && (
+                  <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-4 space-y-2">
+                    <div className="flex items-center gap-2">
+                      <p className="text-xs font-medium text-zinc-400 uppercase tracking-wider">Cluster search summary</p>
+                      <InfoTooltip
+                        title="Why did a visually distant cluster get searched?"
+                        body={"IVF cluster selection is based on distance in the original high-dimensional vector space (e.g. 384d or 768d), not on the 2D scatter plot you see.\n\nThe 2D layout is a PCA/UMAP projection — it compresses hundreds of dimensions into two, which inevitably distorts distances. Two points that look far apart in 2D may actually be close in 768d space, and vice versa.\n\nSo if a searched cluster looks distant on screen, it means it was genuinely among the nprobe nearest centroids in full-dimensional space — the 2D view is just misleading you."}
+                        pos="top-right"
+                      />
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {Array.from({ length: indexData.ivf.n_clusters }, (_, i) => {
+                        const searched = queryResults.ivf_searched_clusters.includes(i)
+                        const count = indexData.ivf.cluster_assignments.filter(a => a === i).length
+                        return (
+                          <div key={i} className={`flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs ${searched ? 'border-amber-500/50 bg-amber-500/10 text-amber-300' : 'border-zinc-700 bg-zinc-900 text-zinc-600'}`}>
+                            <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ background: IVF_CLUSTER_COLORS[i % IVF_CLUSTER_COLORS.length] }} />
+                            <span className="font-semibold">Cluster {i}</span>
+                            <span>{count} chunk{count !== 1 ? 's' : ''}</span>
+                            {searched && <span className="text-amber-500">✓ searched</span>}
+                          </div>
+                        )
+                      })}
+                    </div>
+                    <p className="text-xs text-zinc-600">Searched {queryResults.ivf_searched_clusters.length} of {indexData.ivf.n_clusters} clusters ({Math.round(queryResults.ivf_searched_clusters.length / indexData.ivf.n_clusters * 100)}% of index)</p>
+                  </div>
+                )}
+
+                {queryResults && <IndexResultsList results={queryResults.ivf_results} label="IVF results" color="amber" />}
+              </div>
+            )}
+
+            {/* ── MRL TAB (Nomic only) ── */}
+            {indexTab === 'mrl' && embedModel === 'nomic' && (
+              <div className="space-y-4">
+                <div className="flex items-center gap-2">
+                  <p className="text-xs font-medium text-zinc-500 uppercase tracking-wider">MRL — Matryoshka representation learning</p>
+                  <InfoTooltip
+                    title="What is MRL?"
+                    body={"Nomic Embed 1.5 was trained with Matryoshka Representation Learning — a technique where the model is trained so that the first N dimensions of the vector are themselves a good representation.\n\nThis means you can truncate a 768d vector to 256d, 128d, or even 64d and still get useful results — with graceful accuracy loss.\n\nWhy it matters: smaller vectors = faster search, less memory, lower storage cost. A 64d Nomic vector uses 12× less memory than the full 768d version."}
+                    pos="top-right"
+                  />
+                </div>
+
+                {/* Dim selector */}
+                <div className="flex items-center gap-3">
+                  <span className="text-xs text-zinc-500">Dimensions:</span>
+                  <div className="flex rounded-lg border border-zinc-700 overflow-hidden text-xs">
+                    {[768, 512, 256, 128, 64].map(d => (
+                      <button key={d} onClick={() => setMrlDims(d)}
+                        className={`px-3 py-1.5 font-mono transition-colors ${mrlDims === d ? 'bg-zinc-700 text-zinc-100' : 'text-zinc-500 hover:text-zinc-300'}`}>
+                        {d}d
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Recall table */}
+                {queryResults?.mrl && (
+                  <div className="rounded-xl bg-zinc-900 border border-zinc-800 overflow-hidden">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="border-b border-zinc-800 text-xs text-zinc-500 uppercase tracking-wider">
+                          <th className="text-left px-4 py-3">Dimensions</th>
+                          <th className="text-right px-4 py-3">Memory vs 768d</th>
+                          <th className="text-right px-4 py-3">
+                            <div className="flex items-center justify-end gap-1">Recall@5 <InfoTooltip title="Recall@5" body={"How many of the true top-5 results (at full 768d) are also in the top-5 at this truncated dimension.\n\n1.0 = identical results.\n0.8 = 4 of 5 correct.\n\nMRL ensures graceful degradation — even at 64d, results are often still useful."} pos="top-left" /></div>
+                          </th>
+                          <th className="text-right px-4 py-3">Top result</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {[768, 512, 256, 128, 64].map(d => {
+                          const recall = queryResults.mrl!.recall[String(d)] ?? 0
+                          const topResult = queryResults.mrl!.results_by_dims[String(d)]?.[0]
+                          const isActive = mrlDims === d
+                          return (
+                            <tr key={d} onClick={() => setMrlDims(d)}
+                              className={`border-b border-zinc-800/50 cursor-pointer transition-colors ${isActive ? 'bg-zinc-800/50' : 'hover:bg-zinc-800/20'}`}>
+                              <td className="px-4 py-3 font-mono text-zinc-300">{d}d {d === 768 && <span className="text-xs text-zinc-600 ml-1">full</span>}</td>
+                              <td className="px-4 py-3 text-right text-zinc-500 font-mono text-xs">{Math.round(768 / d)}×</td>
+                              <td className="px-4 py-3 text-right">
+                                <span className={`font-mono font-semibold ${recall === 1 ? 'text-emerald-400' : recall >= 0.8 ? 'text-amber-400' : 'text-rose-400'}`}>
+                                  {Math.round(recall * 100)}%
+                                </span>
+                                <div className="inline-block ml-2 w-16 h-1.5 rounded-full bg-zinc-800 align-middle">
+                                  <div className={`h-full rounded-full ${recall === 1 ? 'bg-emerald-500' : recall >= 0.8 ? 'bg-amber-500' : 'bg-rose-500'}`} style={{ width: `${recall * 100}%` }} />
+                                </div>
+                              </td>
+                              <td className="px-4 py-3 text-right text-xs text-zinc-500">
+                                {topResult ? `#${topResult.idx + 1} (${topResult.sim.toFixed(3)})` : '—'}
+                              </td>
+                            </tr>
+                          )
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+
+                {queryResults?.mrl && (
+                  <IndexResultsList
+                    results={queryResults.mrl.results_by_dims[String(mrlDims)]?.map(r => ({ idx: r.idx, sim: r.sim, text: chunks[r.idx]?.page_content ?? '' })) ?? []}
+                    label={`Results at ${mrlDims}d (recall ${Math.round((queryResults.mrl.recall[String(mrlDims)] ?? 0) * 100)}% vs 768d)`}
+                    color="amber"
+                  />
+                )}
+
+                {!queryResults && <div className="rounded-xl bg-zinc-900 border border-zinc-800 px-5 py-10 text-center text-sm text-zinc-600">Enter a query to see how recall changes as you truncate dimensions</div>}
+              </div>
+            )}
+
           </main>
         </div>
       )}
@@ -1136,5 +1634,319 @@ function CompareHeader({ label, tooltip }: { label: string; tooltip: { title: st
         <InfoTooltip title={tooltip.title} body={tooltip.body} pos="top-left" />
       </div>
     </th>
+  )
+}
+
+// ── Convex hull helpers ───────────────────────────────────────────────────────
+function convexHull(pts: [number, number][]): [number, number][] {
+  if (pts.length < 2) return pts
+  if (pts.length === 2) return pts
+  let left = 0
+  for (let i = 1; i < pts.length; i++) if (pts[i][0] < pts[left][0]) left = i
+  const hull: [number, number][] = []
+  let cur = left
+  do {
+    hull.push(pts[cur])
+    let nxt = (cur + 1) % pts.length
+    for (let i = 0; i < pts.length; i++) {
+      const cross = (pts[nxt][0] - pts[cur][0]) * (pts[i][1] - pts[cur][1])
+                  - (pts[nxt][1] - pts[cur][1]) * (pts[i][0] - pts[cur][0])
+      if (cross < 0) nxt = i
+    }
+    cur = nxt
+  } while (cur !== left && hull.length <= pts.length)
+  return hull
+}
+
+function padHull(hull: [number, number][], pad: number): [number, number][] {
+  const cx = hull.reduce((s, p) => s + p[0], 0) / hull.length
+  const cy = hull.reduce((s, p) => s + p[1], 0) / hull.length
+  return hull.map(([x, y]) => {
+    const dx = x - cx, dy = y - cy
+    const len = Math.sqrt(dx * dx + dy * dy) || 1
+    return [x + (dx / len) * pad, y + (dy / len) * pad] as [number, number]
+  })
+}
+
+function smoothPath(pts: [number, number][]): string {
+  if (pts.length < 2) return ''
+  if (pts.length === 2) return `M ${pts[0][0]},${pts[0][1]} L ${pts[1][0]},${pts[1][1]}`
+  const n = pts.length
+  let d = `M ${pts[0][0]},${pts[0][1]}`
+  for (let i = 0; i < n; i++) {
+    const p0 = pts[(i - 1 + n) % n], p1 = pts[i], p2 = pts[(i + 1) % n], p3 = pts[(i + 2) % n]
+    const cp1x = p1[0] + (p2[0] - p0[0]) / 6
+    const cp1y = p1[1] + (p2[1] - p0[1]) / 6
+    const cp2x = p2[0] - (p3[0] - p1[0]) / 6
+    const cp2y = p2[1] - (p3[1] - p1[1]) / 6
+    d += ` C ${cp1x},${cp1y} ${cp2x},${cp2y} ${p2[0]},${p2[1]}`
+  }
+  return d + ' Z'
+}
+
+// ── Stage 3: Index scatter plot ───────────────────────────────────────────────
+const IVF_CLUSTER_COLORS = [
+  '#f59e0b', '#3b82f6', '#10b981', '#f43f5e', '#8b5cf6',
+  '#06b6d4', '#84cc16', '#fb923c', '#a78bfa', '#34d399',
+]
+
+function IndexScatterPlot({ coords, chunks, queryPoint, highlightedIndices, clusterAssignments, centroids2d, searchedClusters, hnswMeta, activeLayer, traversal, traversalStep, tab }: {
+  coords: [number, number][]; chunks: Chunk[]
+  queryPoint: [number, number] | null
+  highlightedIndices: number[]
+  clusterAssignments: number[] | null
+  centroids2d: [number, number][] | null
+  searchedClusters: number[] | null
+  hnswMeta: HNSWMeta | null
+  activeLayer: number
+  traversal: TraversalStep[] | null
+  traversalStep: number
+  tab: IndexTab
+}) {
+  const W = 620, H = 360, PAD = 36
+  const allPoints = queryPoint ? [...coords, queryPoint] : coords
+  const xs = allPoints.map(c => c[0]), ys = allPoints.map(c => c[1])
+  const xMin = Math.min(...xs), xMax = Math.max(...xs)
+  const yMin = Math.min(...ys), yMax = Math.max(...ys)
+  const xRange = xMax - xMin || 1, yRange = yMax - yMin || 1
+
+  function px(x: number) { return PAD + ((x - xMin) / xRange) * (W - PAD * 2) }
+  function py(y: number) { return H - PAD - ((y - yMin) / yRange) * (H - PAD * 2) }
+
+  const highlightSet = new Set(highlightedIndices)
+
+  // HNSW layer data
+  const layerData = hnswMeta?.layers.find(l => l.level === activeLayer)
+  const layerNodeSet = new Set(layerData?.nodes ?? [])
+
+  // Traversal visited set (all steps up to traversalStep, or all if -1)
+  const traversalVisited = new Set<number>()
+  const traversalBest = new Set<number>()
+  if (traversal) {
+    const steps = traversalStep === -1 ? traversal : traversal.slice(0, traversalStep + 1)
+    steps.forEach(s => { s.visited.forEach(v => traversalVisited.add(v)); traversalBest.add(s.best) })
+  }
+
+  function nodeColor(i: number): string {
+    if (tab === 'ivf' && clusterAssignments) {
+      return IVF_CLUSTER_COLORS[clusterAssignments[i] % IVF_CLUSTER_COLORS.length]
+    }
+    if (tab === 'hnsw' && hnswMeta) {
+      const level = hnswMeta.node_levels[i] ?? 0
+      const colors = ['#6ee7b7', '#34d399', '#10b981', '#059669', '#047857']
+      return colors[Math.min(level, colors.length - 1)]
+    }
+    const col = COLORS[i % COLORS.length]
+    const map: Record<string, string> = {
+      'text-violet-300': '#c4b5fd', 'text-sky-300': '#7dd3fc', 'text-emerald-300': '#6ee7b7',
+      'text-amber-300': '#fcd34d', 'text-rose-300': '#fda4af', 'text-pink-300': '#f9a8d4',
+      'text-cyan-300': '#67e8f9', 'text-lime-300': '#bef264', 'text-orange-300': '#fdba74', 'text-teal-300': '#5eead4',
+    }
+    return map[col.text] ?? '#a1a1aa'
+  }
+
+  const [hovered, setHovered] = useState<number | null>(null)
+
+  return (
+    <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-4 space-y-3">
+      <div className="flex items-center gap-2">
+        <p className="text-xs font-medium text-zinc-400 uppercase tracking-wider">
+          {tab === 'flat' && 'Vector space — all chunks + query'}
+          {tab === 'hnsw' && `HNSW graph — layer ${activeLayer}`}
+          {tab === 'ivf' && 'IVF clusters'}
+          {tab === 'mrl' && 'Vector space'}
+        </p>
+        {tab === 'hnsw' && hnswMeta && (
+          <InfoTooltip
+            title={`Layer ${activeLayer}`}
+            body={activeLayer === 0
+              ? `Layer 0 is the dense base layer — every node is here with up to M×2 = ${hnswMeta.M * 2} connections. This is where final precision comes from.`
+              : `Layer ${activeLayer} is the express highway — only ${layerData?.nodes.length ?? 0} of ${coords.length} nodes appear here, with up to M = ${hnswMeta.M} connections each. Search enters here for fast navigation.`}
+          />
+        )}
+        {tab === 'ivf' && queryPoint && searchedClusters && (
+          <span className="ml-auto text-xs text-zinc-600">
+            Bright = searched cluster · dim = skipped
+          </span>
+        )}
+      </div>
+      <div className="w-full overflow-x-auto">
+        <svg width={W} height={H} className="block mx-auto">
+          {/* Grid */}
+          {[0.25, 0.5, 0.75].map(t => (
+            <g key={t}>
+              <line x1={PAD} x2={W-PAD} y1={PAD + t*(H-PAD*2)} y2={PAD + t*(H-PAD*2)} stroke="#27272a" strokeDasharray="3,3" />
+              <line x1={PAD + t*(W-PAD*2)} x2={PAD + t*(W-PAD*2)} y1={PAD} y2={H-PAD} stroke="#27272a" strokeDasharray="3,3" />
+            </g>
+          ))}
+
+          {/* HNSW edges */}
+          {tab === 'hnsw' && layerData?.edges.map(([a, b], ei) => {
+            const isTraversalEdge = traversalVisited.has(a) && traversalVisited.has(b)
+            return (
+              <line key={ei}
+                x1={px(coords[a][0])} y1={py(coords[a][1])}
+                x2={px(coords[b][0])} y2={py(coords[b][1])}
+                stroke={isTraversalEdge ? '#f59e0b' : '#3f3f46'}
+                strokeWidth={isTraversalEdge ? 1.5 : 0.8}
+                opacity={isTraversalEdge ? 0.7 : 0.4}
+              />
+            )
+          })}
+
+          {/* Query → top-k lines (flat/mrl) */}
+          {(tab === 'flat' || tab === 'mrl') && queryPoint && highlightedIndices.map(i => (
+            <line key={i}
+              x1={px(queryPoint[0])} y1={py(queryPoint[1])}
+              x2={px(coords[i][0])} y2={py(coords[i][1])}
+              stroke="#f59e0b" strokeWidth={1} strokeDasharray="3,3" opacity={0.5}
+            />
+          ))}
+
+          {/* IVF: query → centroid lines */}
+          {tab === 'ivf' && queryPoint && centroids2d && searchedClusters?.map(ci => (
+            <line key={ci}
+              x1={px(queryPoint[0])} y1={py(queryPoint[1])}
+              x2={px(centroids2d[ci][0])} y2={py(centroids2d[ci][1])}
+              stroke={IVF_CLUSTER_COLORS[ci % IVF_CLUSTER_COLORS.length]}
+              strokeWidth={1.5} strokeDasharray="4,3" opacity={0.7}
+            />
+          ))}
+
+          {/* IVF cluster boundaries — convex hull per cluster */}
+          {tab === 'ivf' && clusterAssignments && (() => {
+            const n_clusters = Math.max(...clusterAssignments) + 1
+            return Array.from({ length: n_clusters }, (_, ci) => {
+              const clusterPts = coords
+                .map((c, i) => clusterAssignments[i] === ci ? [px(c[0]), py(c[1])] as [number, number] : null)
+                .filter((p): p is [number, number] => p !== null)
+              if (clusterPts.length === 0) return null
+              const color = IVF_CLUSTER_COLORS[ci % IVF_CLUSTER_COLORS.length]
+              const searched = !searchedClusters || searchedClusters.includes(ci)
+              const sharedProps = {
+                fill: color, fillOpacity: searched ? 0.12 : 0,
+                stroke: color, strokeWidth: 1.5, strokeOpacity: searched ? 0.7 : 0.35, strokeDasharray: "4,3"
+              }
+              // For ≤2 points or degenerate hull, draw a circle that encompasses all points
+              const cxAvg = clusterPts.reduce((s, p) => s + p[0], 0) / clusterPts.length
+              const cyAvg = clusterPts.reduce((s, p) => s + p[1], 0) / clusterPts.length
+              const maxR = clusterPts.reduce((m, [x, y]) => Math.max(m, Math.sqrt((x - cxAvg) ** 2 + (y - cyAvg) ** 2)), 0)
+              if (clusterPts.length <= 2) {
+                return <circle key={ci} cx={cxAvg} cy={cyAvg} r={maxR + 32} {...sharedProps} />
+              }
+              const hull = convexHull(clusterPts)
+              if (hull.length <= 2) {
+                return <circle key={ci} cx={cxAvg} cy={cyAvg} r={maxR + 32} {...sharedProps} />
+              }
+              const padded = padHull(hull, 24)
+              const pathD = smoothPath(padded)
+              return <path key={ci} d={pathD} {...sharedProps} />
+            })
+          })()}
+
+          {/* Chunk nodes */}
+          {coords.map((c, i) => {
+            const fill = nodeColor(i)
+            const isHighlighted = highlightedIndices.length === 0 || highlightSet.has(i)
+            const inLayer = tab !== 'hnsw' || layerNodeSet.has(i)
+            const clusterIdx = clusterAssignments?.[i] ?? 0
+            const clusterSearched = !searchedClusters || searchedClusters.includes(clusterIdx)
+            const isVisited = traversalVisited.has(i)
+            const isBest = traversalBest.has(i)
+            const r = isBest ? 9 : isHighlighted ? 7 : 5
+            const opacity = !inLayer ? 0.1 : tab === 'ivf' && !clusterSearched && searchedClusters ? 0.2 : isHighlighted ? 0.9 : 0.35
+
+            return (
+              <g key={i} className="cursor-pointer"
+                onMouseEnter={() => setHovered(i)} onMouseLeave={() => setHovered(null)}>
+                {isBest && (
+                  <circle cx={px(c[0])} cy={py(c[1])} r={r + 5} fill={fill} fillOpacity={0.15} stroke={fill} strokeWidth={1} strokeDasharray="3,2" />
+                )}
+                {isVisited && !isBest && (
+                  <circle cx={px(c[0])} cy={py(c[1])} r={r + 3} fill="#f59e0b" fillOpacity={0.1} />
+                )}
+                <circle cx={px(c[0])} cy={py(c[1])} r={r}
+                  fill={fill} fillOpacity={opacity}
+                  stroke={isBest ? '#f59e0b' : isHighlighted && isHighlighted ? fill : fill}
+                  strokeWidth={isBest ? 2 : isHighlighted && highlightedIndices.length > 0 ? 1.5 : 0.5}
+                />
+                <text x={px(c[0])} y={py(c[1]) - r - 3} textAnchor="middle" fontSize={9} fill={fill}
+                  fillOpacity={inLayer ? 0.8 : 0.15} className="select-none pointer-events-none font-mono">
+                  #{i+1}
+                </text>
+              </g>
+            )
+          })}
+
+          {/* IVF centroids */}
+          {tab === 'ivf' && centroids2d?.map((c, ci) => {
+            const color = IVF_CLUSTER_COLORS[ci % IVF_CLUSTER_COLORS.length]
+            const searched = !searchedClusters || searchedClusters.includes(ci)
+            return (
+              <g key={ci}>
+                <text x={px(c[0])} y={py(c[1])} textAnchor="middle" dominantBaseline="middle"
+                  fontSize={16} fill={color} fillOpacity={searched ? 0.9 : 0.3}
+                  className="select-none pointer-events-none font-bold">×</text>
+                <text x={px(c[0])} y={py(c[1]) + 14} textAnchor="middle" fontSize={9}
+                  fill={color} fillOpacity={searched ? 0.8 : 0.25} className="select-none pointer-events-none font-mono">
+                  cluster {ci}
+                </text>
+              </g>
+            )
+          })}
+
+          {/* Query point */}
+          {queryPoint && (
+            <g>
+              <circle cx={px(queryPoint[0])} cy={py(queryPoint[1])} r={18} fill="#f59e0b" fillOpacity={0.18} stroke="#f59e0b" strokeWidth={1.5} strokeOpacity={0.6} />
+              <text x={px(queryPoint[0])} y={py(queryPoint[1])} textAnchor="middle" dominantBaseline="middle"
+                fontSize={16} fill="#f59e0b" className="select-none pointer-events-none">★</text>
+              <text x={px(queryPoint[0])} y={py(queryPoint[1]) + 22} textAnchor="middle"
+                fontSize={9} fill="#f59e0b" fillOpacity={0.9} fontWeight="bold" className="select-none pointer-events-none">query</text>
+            </g>
+          )}
+        </svg>
+      </div>
+
+      {hovered !== null && (
+        <div className="rounded-lg bg-zinc-800 border border-zinc-700 px-3 py-2 text-xs text-zinc-300 leading-relaxed">
+          <span className={`font-mono font-bold mr-2`} style={{ color: nodeColor(hovered) }}>#{hovered + 1}</span>
+          {tab === 'hnsw' && hnswMeta && <span className="text-zinc-500 mr-2">level {hnswMeta.node_levels[hovered] ?? 0}</span>}
+          {tab === 'ivf' && clusterAssignments && <span className="text-zinc-500 mr-2">cluster C{clusterAssignments[hovered]}</span>}
+          {chunks[hovered]?.page_content.slice(0, 160)}{(chunks[hovered]?.page_content.length ?? 0) > 160 ? '…' : ''}
+        </div>
+      )}
+      <p className="text-xs text-zinc-600">
+        {tab === 'hnsw' ? 'Gold edges = traversal path · ring = best at that layer · node color = layer height' : ''}
+        {tab === 'ivf' ? '× = cluster centroid · bright = searched · dim = skipped · dashed line = query→centroid path' : ''}
+        {tab === 'flat' ? 'Dashed lines = query→top-k connections · ★ = query position (PCA projection)' : ''}
+      </p>
+    </div>
+  )
+}
+
+// ── Stage 3: Results list ─────────────────────────────────────────────────────
+function IndexResultsList({ results, label, color }: { results: IndexResult[]; label: string; color: string }) {
+  if (!results.length) return null
+  return (
+    <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-4 space-y-3">
+      <p className="text-xs font-medium text-zinc-400 uppercase tracking-wider">{label}</p>
+      <div className="space-y-2">
+        {results.map((r, rank) => (
+          <div key={r.idx} className="flex items-start gap-3 rounded-lg bg-zinc-800/50 px-3 py-2.5">
+            <span className={`text-xs font-bold font-mono w-5 shrink-0 ${color === 'amber' ? 'text-amber-500' : 'text-zinc-400'}`}>#{rank + 1}</span>
+            <div className="flex-1 min-w-0">
+              <p className="text-xs text-zinc-300 leading-relaxed line-clamp-2">{r.text}</p>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <span className={`text-xs font-mono font-semibold ${r.sim > 0.7 ? 'text-emerald-400' : r.sim > 0.4 ? 'text-amber-400' : 'text-zinc-400'}`}>
+                {r.sim.toFixed(3)}
+              </span>
+              <span className="text-xs text-zinc-600">chunk #{r.idx + 1}</span>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
   )
 }
