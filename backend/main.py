@@ -8,6 +8,18 @@ from typing import Literal, Optional, List
 import numpy as np
 from sklearn.decomposition import PCA
 
+# Lazy-loaded MiniLM model for semantic chunking (small, no user interaction required)
+_semantic_model = None
+# Cache: {text_hash: (sentences, embeddings, similarities)} — avoids re-embedding on threshold-only changes
+_semantic_cache: dict = {}
+
+def get_semantic_model():
+    global _semantic_model
+    if _semantic_model is None:
+        from sentence_transformers import SentenceTransformer
+        _semantic_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    return _semantic_model
+
 app = FastAPI(title="RAG Lab Backend")
 
 app.add_middleware(
@@ -119,8 +131,9 @@ def chunk_semantic(
     breakpoint_threshold: float,
 ) -> tuple[list[str], list[float]]:
     """
-    Split on sentence boundaries where cosine similarity between adjacent
-    sentences drops below breakpoint_threshold.
+    Split on sentence boundaries where embedding cosine similarity between
+    adjacent sentences drops below breakpoint_threshold.
+    Uses MiniLM embeddings — real semantic similarity, not word overlap.
     Returns (chunks, similarity_scores) — one score per sentence boundary.
     """
     sentence_re = re.compile(r'(?<=[.!?])\s+')
@@ -129,33 +142,26 @@ def chunk_semantic(
     if len(sentences) <= 1:
         return [text], []
 
-    # Build vocabulary + IDF over all sentences
-    all_tokens = [set(re.findall(r'\w+', s.lower())) for s in sentences]
-    vocab_set: set[str] = set()
-    for ts in all_tokens:
-        vocab_set |= ts
-    vocab = {w: i for i, w in enumerate(sorted(vocab_set))}
-    N = len(sentences)
-    idf = [
-        math.log((N + 1) / (1 + sum(1 for ts in all_tokens if w in ts))) + 1
-        for w in sorted(vocab_set)
-    ]
+    # Use cached embeddings if text hasn't changed — only threshold differs
+    import hashlib
+    text_hash = hashlib.md5(text.encode()).hexdigest()
+    if text_hash in _semantic_cache:
+        sentences, similarities = _semantic_cache[text_hash]
+    else:
+        model = get_semantic_model()
+        embeddings = model.encode(sentences, normalize_embeddings=True, show_progress_bar=False)
+        similarities = [round(float(np.dot(embeddings[i], embeddings[i + 1])), 4)
+                        for i in range(len(sentences) - 1)]
+        _semantic_cache.clear()  # keep only the most recent text
+        _semantic_cache[text_hash] = (sentences, similarities)
 
-    # Compute similarity between each adjacent pair
-    similarities: list[float] = []
-    for i in range(len(sentences) - 1):
-        sim = tfidf_cosine(sentences[i], sentences[i + 1], vocab, idf)
-        similarities.append(round(sim, 4))
-
-    # Build chunks: break when similarity < threshold
+    # Build chunks: break when similarity < threshold or chunk_size exceeded
     chunks: list[str] = []
     current_sentences: list[str] = [sentences[0]]
 
     for i, sim in enumerate(similarities):
         next_sent = sentences[i + 1]
         prospective = " ".join(current_sentences + [next_sent])
-
-        # Force a split if adding next sentence exceeds chunk_size
         force_split = len(prospective) > chunk_size
 
         if sim < breakpoint_threshold or force_split:

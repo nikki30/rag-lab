@@ -425,7 +425,7 @@ export default function Home() {
                 hint="Split when similarity drops below this" decimals={2}
                 tooltip={{
                   title: 'Breakpoint Threshold',
-                  body: 'When two adjacent sentences have similarity below this value, the algorithm decides the topic changed and starts a new chunk.\n\nLow (0.1) → fewer, bigger chunks.\nHigh (0.8) → splits at every slight shift, many small chunks.\n\nWatch the bar chart below: red bars are where splits happen. Drag this slider and re-chunk to move the cutoff line.',
+                  body: 'When two adjacent sentences have embedding cosine similarity below this threshold, the algorithm decides the topic changed and starts a new chunk.\n\nThe similarity is computed using real MiniLM sentence embeddings — not word overlap. Sentences on the same topic typically score 0.5–0.9. A topic shift drops toward 0.2–0.4.\n\nLow threshold (0.2) → only splits at strong topic shifts → fewer, bigger chunks.\nHigh threshold (0.7) → splits at any slight change → many small chunks.\n\nWatch the bar chart: red bars are where splits happen. Set the threshold then click Chunk Text to apply.',
                 }}
               />
             ) : (
