@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useState, useMemo, useRef } from 'react'
+import React, { useState, useMemo, useRef, useEffect } from 'react'
 
 const SAMPLE_TEXT = `Retrieval-Augmented Generation (RAG) is a technique that combines the strengths of large language models with external knowledge retrieval. Instead of relying solely on the knowledge encoded in a model's parameters during training, RAG systems first retrieve relevant documents from a knowledge base, then use those documents as context when generating a response.
 
@@ -428,10 +428,14 @@ export default function Home() {
 
   // ── Retrieval stage ──
   const [retrieveQuery, setRetrieveQuery] = useState('')
+  // Pre-fill Stage 4 query from Stage 3 when it first becomes non-empty
+  useEffect(() => {
+    if (queryText && !retrieveQuery) setRetrieveQuery(queryText)
+  }, [queryText])
   const [retrieveLoading, setRetrieveLoading] = useState(false)
   const [retrieveResult, setRetrieveResult] = useState<RetrieveResponse | null>(null)
   const [retrieveError, setRetrieveError] = useState<string | null>(null)
-  const [retrieveTab, setRetrieveTab] = useState<'results' | 'shifts' | 'colbert'>('results')
+  const [retrieveTab, setRetrieveTab] = useState<'results' | 'shifts' | 'reranking'>('results')
   const retrieveSectionRef = useRef<HTMLDivElement>(null)
 
   const overlapError = strategy !== 'semantic' && chunkOverlap >= chunkSize
@@ -1588,9 +1592,9 @@ export default function Home() {
                 {/* Tab bar */}
                 <div className="flex items-center gap-1 rounded-xl bg-zinc-900 border border-zinc-800 p-1 w-fit">
                   {([
-                    ['results', 'Results'],
-                    ['shifts',  'Rank Shifts'],
-                    ['colbert', 'ColBERT ✦'],
+                    ['results',   'Results'],
+                    ['shifts',    'Rank Shifts'],
+                    ['reranking', 'Re-ranking ✦'],
                   ] as [typeof retrieveTab, string][]).map(([id, label]) => (
                     <button key={id} onClick={() => setRetrieveTab(id)}
                       className={`px-4 py-1.5 rounded-lg text-sm font-semibold transition-colors ${retrieveTab === id ? 'bg-violet-600 text-white' : 'text-zinc-500 hover:text-zinc-300'}`}>
@@ -1737,24 +1741,89 @@ export default function Home() {
                   </div>
                 )}
 
-                {/* ── COLBERT TAB ── */}
-                {retrieveTab === 'colbert' && (
-                  <div className="space-y-3">
-                    <div className="flex items-center gap-2">
-                      <p className="text-xs font-medium text-zinc-400 uppercase tracking-wider">ColBERT — alternative re-ranking via late interaction</p>
-                      <InfoTooltip
-                        title="ColBERT — an alternative to the cross-encoder"
-                        body={"Both ColBERT and cross-encoder are RE-RANKING methods — they score a small candidate set more carefully than dense retrieval can. They are different ways to solve the same problem.\n\nCross-encoder: reads query + chunk together in one forward pass. Most accurate, but nothing is pre-computable — every query needs a fresh forward pass per candidate.\n\nColBERT (late interaction): instead of one vector per chunk, stores one vector per chunk token. At query time, for each query token, find the chunk token most similar to it (MaxSim). Sum those per-token maximums → the ColBERT score. Chunk token vectors are pre-computed and stored; only the MaxSim lookup happens at query time.\n\nWhy 'late interaction'? The query and chunk don't interact at encode time — they're encoded separately. The interaction (which query token matches which chunk token) happens late, at score time.\n\nThe heatmap shows the full (query tokens × chunk tokens) similarity matrix. Gold outline = the MaxSim winner for that query token — the score that gets added to the total. The sum on the right is the ColBERT score.\n\nStorage cost: ColBERT stores ~100 tokens × 128 dims per chunk instead of 384 dims — roughly 33× more. This is why ColBERT is mostly research / high-stakes retrieval rather than standard production."}
-                        pos="top-right"
-                      />
-                    </div>
-                    {retrieveResult.colbert ? (
-                      <ColBERTHeatmap data={retrieveResult.colbert} topChunk={retrieveResult.reranked[0]} />
-                    ) : (
-                      <div className="rounded-xl bg-zinc-900 border border-zinc-800 px-5 py-10 text-center text-sm text-zinc-600">
-                        ColBERT token embeddings are not available for this model configuration.
+                {/* ── RE-RANKING TAB ── */}
+                {retrieveTab === 'reranking' && (
+                  <div className="space-y-6">
+
+                    {/* Cross-encoder section */}
+                    <div className="space-y-3">
+                      <div className="flex items-center gap-2">
+                        <div className="w-2 h-2 rounded-full bg-amber-500/60" />
+                        <p className="text-xs font-bold uppercase tracking-wide text-amber-400">Cross-encoder scoring</p>
+                        <InfoTooltip
+                          title="How the cross-encoder re-ranks"
+                          body={"After hybrid retrieval finds the top-20 candidates, each one is passed to the cross-encoder with the query.\n\nDense retrieval encoded query and chunk separately, then compared two fixed vectors. The query and chunk never saw each other.\n\nThe cross-encoder takes them together:\n[query] [SEP] [chunk] → full transformer forward pass → one relevance score\n\n[SEP] is a separator token. The model reads both sides with full attention — every query token can attend to every chunk token. It can find that 'caused by' in the chunk directly answers 'what causes' in the query.\n\nThe output score is a learned relevance logit — not cosine. Only use it for ranking, not as an absolute value.\n\nLook for rank shifts: a chunk that hybrid ranked #4 but cross-encoder moved to #1 means cosine similarity alone underestimated how well it answers the query."}
+                          pos="top-right"
+                        />
+                        <span className="text-[10px] text-zinc-600 ml-2">scores top-20 hybrid candidates — shows top {retrieveResult.reranked.length}</span>
                       </div>
-                    )}
+                      <div className="rounded-xl bg-zinc-900 border border-amber-500/20 overflow-hidden">
+                        <table className="w-full text-xs">
+                          <thead>
+                            <tr className="border-b border-zinc-800 text-zinc-500 uppercase tracking-wider">
+                              <th className="text-left px-4 py-2.5">Chunk</th>
+                              <th className="text-center px-3 py-2.5 text-violet-500/70">Hybrid rank</th>
+                              <th className="text-center px-3 py-2.5">→</th>
+                              <th className="text-center px-3 py-2.5 text-amber-500/70">CE rank</th>
+                              <th className="text-right px-4 py-2.5 text-amber-500/70">CE score</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {retrieveResult.reranked.map((r, newRank) => {
+                              const shift = retrieveResult.rank_shifts.find(s => s.idx === r.idx)
+                              const hybridRank = shift?.hybrid_rank ?? null
+                              const moved = hybridRank !== null ? hybridRank - (newRank + 1) : null
+                              return (
+                                <tr key={r.idx} className="border-b border-zinc-800/50 hover:bg-zinc-800/20 transition-colors">
+                                  <td className="px-4 py-2.5 text-zinc-400 max-w-xs">
+                                    <span className="text-zinc-600 font-mono mr-2">#{r.idx + 1}</span>
+                                    <span className="line-clamp-1">{r.text}</span>
+                                  </td>
+                                  <td className="text-center px-3 py-2.5 font-mono text-violet-400">
+                                    {hybridRank !== null ? `#${hybridRank}` : '—'}
+                                  </td>
+                                  <td className="text-center px-3 py-2.5 text-xs">
+                                    {moved === null ? '' : moved > 0
+                                      ? <span className="text-emerald-400">↑{moved}</span>
+                                      : moved < 0
+                                      ? <span className="text-rose-400">↓{Math.abs(moved)}</span>
+                                      : <span className="text-zinc-600">—</span>}
+                                  </td>
+                                  <td className="text-center px-3 py-2.5 font-mono font-bold text-amber-400">
+                                    #{newRank + 1}
+                                  </td>
+                                  <td className="text-right px-4 py-2.5 font-mono text-zinc-400">
+                                    {r.score.toFixed(3)}
+                                  </td>
+                                </tr>
+                              )
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+
+                    {/* ColBERT section */}
+                    <div className="space-y-3">
+                      <div className="flex items-center gap-2">
+                        <div className="w-2 h-2 rounded-full bg-amber-300/60" />
+                        <p className="text-xs font-bold uppercase tracking-wide text-amber-300">ColBERT late interaction</p>
+                        <InfoTooltip
+                          title="ColBERT — an alternative re-ranking approach"
+                          body={"Both cross-encoder and ColBERT are re-ranking methods — they score a small candidate set more carefully than dense retrieval. Different mechanisms, same job.\n\nCross-encoder reads query + chunk together in one pass. Nothing pre-computable.\n\nColBERT keeps one vector per chunk token (pre-computed). At query time, for each query token, find the chunk token most similar to it (MaxSim). Sum those per-token scores → ColBERT score.\n\nWhy 'late interaction'? Query and chunk are encoded separately. The interaction — matching query tokens to chunk tokens — happens late, at score time only.\n\nThe heatmap shows the (query tokens × chunk tokens) similarity matrix for the top-ranked chunk. Gold outline on each row = the MaxSim winner for that query token, the score that gets added to the total. The numbers on the right sum to the final ColBERT score.\n\nStorage cost: ~100 tokens × 128 dims per chunk vs 384 dims for dense — roughly 33× more. This is ColBERT's main production drawback."}
+                          pos="top-right"
+                        />
+                        <span className="text-[10px] text-zinc-600 ml-2">shown for top re-ranked chunk only</span>
+                      </div>
+                      {retrieveResult.colbert ? (
+                        <ColBERTHeatmap data={retrieveResult.colbert} topChunk={retrieveResult.reranked[0]} />
+                      ) : (
+                        <div className="rounded-xl bg-zinc-900 border border-zinc-800 px-5 py-10 text-center text-sm text-zinc-600">
+                          ColBERT token embeddings are not available for this model configuration.
+                        </div>
+                      )}
+                    </div>
+
                   </div>
                 )}
               </div>
