@@ -752,22 +752,33 @@ async def retrieve(request: RetrieveRequest):
     reranked_results = [{"idx": i, "score": round(s, 4), "text": chunks[i]}
                         for i, s in ce_ranked[:k]]
 
-    # ── ColBERT late interaction (top re-ranked chunk) ────────────────────
+    # ── ColBERT late interaction (all reranked candidates) ───────────────
     colbert_data = None
+    colbert_scores: dict[int, float] = {}
     if reranked_results:
         try:
-            top_idx = reranked_results[0]["idx"]
             q_toks, q_embeds = _encode_tokens(model, request.query, max_tokens=24)
-            c_toks, c_embeds = _encode_tokens(model, chunks[top_idx], max_tokens=48)
-            sim_matrix = (q_embeds @ c_embeds.T).tolist()
+            top_c_toks, top_sim_matrix = None, None
+            for i, res in enumerate(reranked_results):
+                idx = res["idx"]
+                c_toks_i, c_embeds_i = _encode_tokens(model, chunks[idx], max_tokens=48)
+                sim_i = q_embeds @ c_embeds_i.T
+                colbert_scores[idx] = float(sim_i.max(axis=1).sum())
+                if i == 0:
+                    top_c_toks = c_toks_i
+                    top_sim_matrix = sim_i.tolist()
             colbert_data = {
                 "query_tokens": q_toks,
-                "chunk_tokens": c_toks,
-                "sim_matrix": sim_matrix,
-                "chunk_idx": top_idx,
+                "chunk_tokens": top_c_toks,
+                "sim_matrix": top_sim_matrix,
+                "chunk_idx": reranked_results[0]["idx"],
+                "scores": colbert_scores,
             }
         except Exception:
             pass
+
+    # ColBERT ranked order (descending score)
+    colbert_order = sorted(colbert_scores, key=lambda i: -colbert_scores[i])
 
     # ── Rank shift table ──────────────────────────────────────────────────
     all_top = list(dict.fromkeys(
@@ -789,6 +800,7 @@ async def retrieve(request: RetrieveRequest):
             "sparse_rank": rank_in(idx, sparse_results),
             "hybrid_rank": rank_in(idx, hybrid_results),
             "reranked_rank": rank_in(idx, reranked_results),
+            "colbert_rank": (colbert_order.index(idx) + 1) if idx in colbert_scores else None,
         }
         for idx in all_top
     ]

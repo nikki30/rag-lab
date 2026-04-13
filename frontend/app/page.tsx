@@ -82,10 +82,12 @@ interface RankShift {
   idx: number; text: string
   dense_rank: number | null; sparse_rank: number | null
   hybrid_rank: number | null; reranked_rank: number | null
+  colbert_rank: number | null
 }
 interface ColBERTData {
   query_tokens: string[]; chunk_tokens: string[]
   sim_matrix: number[][]; chunk_idx: number
+  scores: Record<string, number>
 }
 interface RetrieveResponse {
   dense: RetrieveResult[]; sparse: RetrieveResult[]
@@ -1707,20 +1709,32 @@ export default function Home() {
                     <div className="rounded-xl bg-zinc-900 border border-zinc-800 overflow-hidden">
                       <table className="w-full text-xs">
                         <thead>
+                          {/* Phase group headers */}
+                          <tr className="border-b border-zinc-800/50">
+                            <th className="px-4 py-2" />
+                            <th colSpan={3} className="text-center px-3 py-2 text-zinc-600 text-[10px] uppercase tracking-widest font-normal border-l border-zinc-800">
+                              Phase 1 — Retrieval
+                            </th>
+                            <th colSpan={2} className="text-center px-3 py-2 text-amber-600/70 text-[10px] uppercase tracking-widest font-normal border-l border-zinc-800">
+                              Phase 2 — Re-ranking
+                            </th>
+                          </tr>
+                          {/* Column headers */}
                           <tr className="border-b border-zinc-800 text-zinc-500 uppercase tracking-wider">
-                            <th className="text-left px-4 py-3">Chunk</th>
-                            <th className="text-center px-3 py-3 text-sky-500/70">Dense</th>
-                            <th className="text-center px-3 py-3 text-emerald-500/70">Sparse</th>
-                            <th className="text-center px-3 py-3 text-violet-500/70">Hybrid</th>
-                            <th className="text-center px-3 py-3 text-amber-500/70">Re-ranked</th>
+                            <th className="text-left px-4 py-2.5">Chunk</th>
+                            <th className="text-center px-3 py-2.5 text-sky-500/70 border-l border-zinc-800">Dense</th>
+                            <th className="text-center px-3 py-2.5 text-emerald-500/70">Sparse</th>
+                            <th className="text-center px-3 py-2.5 text-violet-500/70">Hybrid</th>
+                            <th className="text-center px-3 py-2.5 text-amber-500/70 border-l border-zinc-800">Cross-enc</th>
+                            <th className="text-center px-3 py-2.5 text-amber-300/70">ColBERT</th>
                           </tr>
                         </thead>
                         <tbody>
                           {retrieveResult.rank_shifts.map((s) => {
-                            const rankCell = (r: number | null, col: string) => {
-                              if (r === null) return <td key={col} className="text-center px-3 py-2.5 text-zinc-700">—</td>
-                              const bg = r === 1 ? 'bg-amber-500/20 text-amber-300 font-bold' : r <= 3 ? 'text-zinc-300' : 'text-zinc-600'
-                              return <td key={col} className={`text-center px-3 py-2.5 font-mono ${bg}`}>#{r}</td>
+                            const rankCell = (r: number | null, col: string, borderLeft = false) => {
+                              if (r === null) return <td key={col} className={`text-center px-3 py-2.5 text-zinc-700 ${borderLeft ? 'border-l border-zinc-800' : ''}`}>—</td>
+                              const bg = r === 1 ? 'bg-amber-500/20 text-amber-300 font-bold' : r <= 3 ? 'text-zinc-300' : 'text-zinc-500'
+                              return <td key={col} className={`text-center px-3 py-2.5 font-mono ${bg} ${borderLeft ? 'border-l border-zinc-800' : ''}`}>#{r}</td>
                             }
                             return (
                               <tr key={s.idx} className="border-b border-zinc-800/50 hover:bg-zinc-800/20 transition-colors">
@@ -1728,10 +1742,11 @@ export default function Home() {
                                   <span className="text-zinc-600 font-mono mr-2">#{s.idx + 1}</span>
                                   <span className="line-clamp-1">{s.text}</span>
                                 </td>
-                                {rankCell(s.dense_rank, 'dense')}
-                                {rankCell(s.sparse_rank, 'sparse')}
-                                {rankCell(s.hybrid_rank, 'hybrid')}
-                                {rankCell(s.reranked_rank, 'reranked')}
+                                {rankCell(s.dense_rank,     'dense',     true)}
+                                {rankCell(s.sparse_rank,    'sparse'        )}
+                                {rankCell(s.hybrid_rank,    'hybrid'        )}
+                                {rankCell(s.reranked_rank,  'reranked',  true)}
+                                {rankCell(s.colbert_rank,   'colbert'       )}
                               </tr>
                             )
                           })}
@@ -1760,39 +1775,56 @@ export default function Home() {
                       <div className="rounded-xl bg-zinc-900 border border-amber-500/20 overflow-hidden">
                         <table className="w-full text-xs">
                           <thead>
+                            <tr className="border-b border-zinc-800/50">
+                              <th className="px-4 py-1.5" />
+                              <th className="text-center px-3 py-1.5 text-zinc-600 text-[10px] uppercase tracking-widest font-normal border-l border-zinc-800" colSpan={1}>Retrieval</th>
+                              <th className="px-1" />
+                              <th colSpan={2} className="text-center px-3 py-1.5 text-amber-600/70 text-[10px] uppercase tracking-widest font-normal border-l border-zinc-800">Re-ranking</th>
+                              <th className="px-4 py-1.5" />
+                            </tr>
                             <tr className="border-b border-zinc-800 text-zinc-500 uppercase tracking-wider">
                               <th className="text-left px-4 py-2.5">Chunk</th>
-                              <th className="text-center px-3 py-2.5 text-violet-500/70">Hybrid rank</th>
-                              <th className="text-center px-3 py-2.5">→</th>
-                              <th className="text-center px-3 py-2.5 text-amber-500/70">CE rank</th>
-                              <th className="text-right px-4 py-2.5 text-amber-500/70">CE score</th>
+                              <th className="text-center px-3 py-2.5 text-violet-500/70 border-l border-zinc-800">Hybrid</th>
+                              <th className="text-center px-2 py-2.5">→</th>
+                              <th className="text-center px-3 py-2.5 text-amber-500/70 border-l border-zinc-800">Cross-enc</th>
+                              <th className="text-center px-3 py-2.5 text-amber-300/70">ColBERT</th>
+                              <th className="text-right px-4 py-2.5 text-zinc-600">CE score</th>
                             </tr>
                           </thead>
                           <tbody>
                             {retrieveResult.reranked.map((r, newRank) => {
                               const shift = retrieveResult.rank_shifts.find(s => s.idx === r.idx)
                               const hybridRank = shift?.hybrid_rank ?? null
-                              const moved = hybridRank !== null ? hybridRank - (newRank + 1) : null
+                              const colbertRank = shift?.colbert_rank ?? null
+                              const ceMoved = hybridRank !== null ? hybridRank - (newRank + 1) : null
+                              const cbMoved = hybridRank !== null && colbertRank !== null ? hybridRank - colbertRank : null
+                              const shiftBadge = (moved: number | null) => {
+                                if (moved === null) return <span className="text-zinc-600">—</span>
+                                if (moved > 0)  return <span className="text-emerald-400">↑{moved}</span>
+                                if (moved < 0)  return <span className="text-rose-400">↓{Math.abs(moved)}</span>
+                                return <span className="text-zinc-600">=</span>
+                              }
                               return (
                                 <tr key={r.idx} className="border-b border-zinc-800/50 hover:bg-zinc-800/20 transition-colors">
                                   <td className="px-4 py-2.5 text-zinc-400 max-w-xs">
                                     <span className="text-zinc-600 font-mono mr-2">#{r.idx + 1}</span>
                                     <span className="line-clamp-1">{r.text}</span>
                                   </td>
-                                  <td className="text-center px-3 py-2.5 font-mono text-violet-400">
+                                  <td className="text-center px-3 py-2.5 font-mono text-violet-400 border-l border-zinc-800">
                                     {hybridRank !== null ? `#${hybridRank}` : '—'}
                                   </td>
-                                  <td className="text-center px-3 py-2.5 text-xs">
-                                    {moved === null ? '' : moved > 0
-                                      ? <span className="text-emerald-400">↑{moved}</span>
-                                      : moved < 0
-                                      ? <span className="text-rose-400">↓{Math.abs(moved)}</span>
+                                  <td className="text-center px-2 py-2.5 text-zinc-700">→</td>
+                                  <td className="text-center px-3 py-2.5 border-l border-zinc-800">
+                                    <span className="font-mono font-bold text-amber-400">#{newRank + 1}</span>
+                                    <span className="ml-1.5 text-[10px]">{shiftBadge(ceMoved)}</span>
+                                  </td>
+                                  <td className="text-center px-3 py-2.5">
+                                    {colbertRank !== null
+                                      ? <><span className="font-mono font-bold text-amber-300">#{colbertRank}</span>
+                                          <span className="ml-1.5 text-[10px]">{shiftBadge(cbMoved)}</span></>
                                       : <span className="text-zinc-600">—</span>}
                                   </td>
-                                  <td className="text-center px-3 py-2.5 font-mono font-bold text-amber-400">
-                                    #{newRank + 1}
-                                  </td>
-                                  <td className="text-right px-4 py-2.5 font-mono text-zinc-400">
+                                  <td className="text-right px-4 py-2.5 font-mono text-zinc-500">
                                     {r.score.toFixed(3)}
                                   </td>
                                 </tr>
