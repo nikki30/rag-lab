@@ -968,12 +968,27 @@ export default function Home() {
 
             {/* Tab bar */}
             <div className="flex items-center gap-1 rounded-xl bg-zinc-900 border border-zinc-800 p-1 w-fit">
-              {(['flat', 'hnsw', 'ivf', ...(embedModel === 'nomic' ? ['mrl'] : [])] as IndexTab[]).map(tab => (
+              {(['flat', 'hnsw', 'ivf'] as IndexTab[]).map(tab => (
                 <button key={tab} onClick={() => setIndexTab(tab)}
                   className={`px-4 py-1.5 rounded-lg text-sm font-semibold transition-colors uppercase tracking-wide ${indexTab === tab ? 'bg-amber-600 text-white' : 'text-zinc-500 hover:text-zinc-300'}`}>
-                  {tab === 'mrl' ? 'MRL ✦' : tab}
+                  {tab}
                 </button>
               ))}
+              {embedModel === 'nomic' ? (
+                <button onClick={() => setIndexTab('mrl')}
+                  className={`px-4 py-1.5 rounded-lg text-sm font-semibold transition-colors uppercase tracking-wide ${indexTab === 'mrl' ? 'bg-amber-600 text-white' : 'text-zinc-500 hover:text-zinc-300'}`}>
+                  MRL ✦
+                </button>
+              ) : (
+                <div className="relative group">
+                  <button disabled className="px-4 py-1.5 rounded-lg text-sm font-semibold uppercase tracking-wide text-zinc-700 cursor-not-allowed">
+                    MRL ✦
+                  </button>
+                  <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 w-56 rounded-lg bg-zinc-800 border border-zinc-700 p-2.5 text-xs text-zinc-400 hidden group-hover:block pointer-events-none z-50 whitespace-normal">
+                    MRL requires the <span className="text-amber-400 font-semibold">Nomic</span> embedding model — it's the only model trained with Matryoshka dimensions. Switch to Nomic in Stage 2 and re-embed to unlock this tab.
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* ── FLAT TAB ── */}
@@ -1224,9 +1239,10 @@ export default function Home() {
               <div className="space-y-4">
                 <div className="flex items-center gap-2">
                   <p className="text-xs font-medium text-zinc-500 uppercase tracking-wider">MRL — Matryoshka representation learning</p>
+                  <span className="text-[10px] text-zinc-600 font-normal normal-case">Nomic only</span>
                   <InfoTooltip
-                    title="What is MRL?"
-                    body={"Nomic Embed 1.5 was trained with Matryoshka Representation Learning — a technique where the model is trained so that the first N dimensions of the vector are themselves a good representation.\n\nThis means you can truncate a 768d vector to 256d, 128d, or even 64d and still get useful results — with graceful accuracy loss.\n\nWhy it matters: smaller vectors = faster search, less memory, lower storage cost. A 64d Nomic vector uses 12× less memory than the full 768d version."}
+                    title="What is MRL — and why Nomic only?"
+                    body={"MRL is a training-time property, not something you can apply to any model.\n\nA normal model (MiniLM, BGE, MPNet) produces a vector where all dimensions work together as a unit. Truncating it to fewer dimensions produces garbage — those first N numbers were never trained to be independently meaningful.\n\nNomic Embed 1.5 was trained with Matryoshka Representation Learning, which forces the model to pack the most important information into the first dimensions, then progressively add detail. So the first 64 dimensions are themselves a valid (though less precise) representation. Truncating to 64d, 128d, 256d gives graceful accuracy loss instead of garbage.\n\nThe pipeline rule: embedding and retrieval must use the same dimensionality. You can't embed chunks at 768d and search at 64d unless you truncate both sides consistently — stored chunk vectors AND the query vector — to the same d. That's exactly what this tab demonstrates.\n\nWhy it matters in production: smaller vectors = faster index search, less RAM, lower storage cost. A 64d Nomic vector is 12× smaller than 768d with surprisingly good recall."}
                     pos="top-right"
                   />
                 </div>
