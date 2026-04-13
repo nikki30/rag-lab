@@ -76,6 +76,23 @@ interface QueryIndexResponse {
   mrl: MRLData | null
 }
 
+// ── Stage 4: Retrieval types ──────────────────────────────────────────────────
+interface RetrieveResult { idx: number; score: number; text: string }
+interface RankShift {
+  idx: number; text: string
+  dense_rank: number | null; sparse_rank: number | null
+  hybrid_rank: number | null; reranked_rank: number | null
+}
+interface ColBERTData {
+  query_tokens: string[]; chunk_tokens: string[]
+  sim_matrix: number[][]; chunk_idx: number
+}
+interface RetrieveResponse {
+  dense: RetrieveResult[]; sparse: RetrieveResult[]
+  hybrid: RetrieveResult[]; reranked: RetrieveResult[]
+  colbert: ColBERTData | null; rank_shifts: RankShift[]
+}
+
 const EMBED_MODELS: EmbedModel[] = [
   { id: 'minilm',    label: 'MiniLM-L6',       dims: 384, speed: 'Fast',    tagline: 'Industry default',       description: 'The workhorse of local RAG. Small, fast, surprisingly good. 384 numbers per chunk. Best starting point.' },
   { id: 'bge-small', label: 'BGE-Small',        dims: 384, speed: 'Fast',    tagline: 'State-of-the-art small', description: 'BAAI\'s model beats MiniLM on retrieval benchmarks at the same size. Same speed, better recall. Current SOTA at 384d.' },
@@ -207,6 +224,158 @@ function SliderControl({ label, value, min, max, step, onChange, hint, error, de
   )
 }
 
+// ── ColBERT heatmap ───────────────────────────────────────────────────────────
+function ColBERTHeatmap({ data, topChunk }: { data: ColBERTData; topChunk: RetrieveResult | undefined }) {
+  const { query_tokens, chunk_tokens, sim_matrix } = data
+
+  // Find the MaxSim winner per query token (max value index per row)
+  const maxSimCols: number[] = sim_matrix.map(row => {
+    let best = 0
+    for (let c = 1; c < row.length; c++) if (row[c] > row[best]) best = c
+    return best
+  })
+
+  const colbertScore = sim_matrix.reduce((sum, row, r) => sum + (row[maxSimCols[r]] ?? 0), 0)
+
+  // Color scale: 0 → zinc-900, 1 → amber-400
+  function cellColor(v: number): string {
+    const t = Math.max(0, Math.min(1, v))
+    // interpolate zinc-900 (#18181b) → amber-400 (#fbbf24)
+    const r = Math.round(24 + t * (251 - 24))
+    const g = Math.round(24 + t * (191 - 24))
+    const b = Math.round(27 + t * (36 - 27))
+    return `rgb(${r},${g},${b})`
+  }
+
+  const CELL = 36
+  const ROW_LABEL_W = 120
+  const COL_LABEL_H = 80
+  const svgW = ROW_LABEL_W + chunk_tokens.length * CELL
+  const svgH = COL_LABEL_H + query_tokens.length * CELL + 32
+
+  return (
+    <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-5 space-y-4">
+      <div className="flex items-center gap-2">
+        <span className="text-sm font-semibold text-amber-400">ColBERT Late Interaction</span>
+        <InfoTooltip
+          title="ColBERT late interaction"
+          body={"Each query token gets its own embedding. Each chunk token gets its own embedding.\n\nFor every query token, find the chunk token most similar to it (MaxSim — the gold-outlined cell in each row). Sum those MaxSim scores → the ColBERT score.\n\nThis is more expressive than a single dot product because individual token matches can outweigh unrelated tokens."}
+        />
+      </div>
+
+      <div className="overflow-x-auto">
+        <svg width={svgW} height={svgH} style={{ display: 'block' }}>
+          {/* Rotated column labels (chunk tokens) */}
+          {chunk_tokens.map((tok, c) => (
+            <text
+              key={c}
+              x={ROW_LABEL_W + c * CELL + CELL / 2}
+              y={COL_LABEL_H - 6}
+              textAnchor="start"
+              transform={`rotate(-45, ${ROW_LABEL_W + c * CELL + CELL / 2}, ${COL_LABEL_H - 6})`}
+              fontSize={10}
+              fill="#a1a1aa"
+            >{tok}</text>
+          ))}
+
+          {/* Row labels (query tokens) + cells */}
+          {query_tokens.map((qtok, r) => (
+            <g key={r}>
+              {/* Query token label */}
+              <text
+                x={ROW_LABEL_W - 8}
+                y={COL_LABEL_H + r * CELL + CELL / 2 + 4}
+                textAnchor="end"
+                fontSize={11}
+                fontWeight={600}
+                fill="#e4e4e7"
+              >{qtok}</text>
+
+              {/* Cells */}
+              {chunk_tokens.map((_, c) => {
+                const v = sim_matrix[r]?.[c] ?? 0
+                const isMax = maxSimCols[r] === c
+                return (
+                  <g key={c}>
+                    <rect
+                      x={ROW_LABEL_W + c * CELL + 1}
+                      y={COL_LABEL_H + r * CELL + 1}
+                      width={CELL - 2}
+                      height={CELL - 2}
+                      rx={3}
+                      fill={cellColor(v)}
+                    />
+                    {/* Gold MaxSim outline */}
+                    {isMax && (
+                      <rect
+                        x={ROW_LABEL_W + c * CELL + 1}
+                        y={COL_LABEL_H + r * CELL + 1}
+                        width={CELL - 2}
+                        height={CELL - 2}
+                        rx={3}
+                        fill="none"
+                        stroke="#fbbf24"
+                        strokeWidth={2}
+                      />
+                    )}
+                    {/* Value label */}
+                    <text
+                      x={ROW_LABEL_W + c * CELL + CELL / 2}
+                      y={COL_LABEL_H + r * CELL + CELL / 2 + 4}
+                      textAnchor="middle"
+                      fontSize={9}
+                      fill={v > 0.5 ? '#18181b' : '#71717a'}
+                    >{v.toFixed(2)}</text>
+                  </g>
+                )
+              })}
+
+              {/* MaxSim score label at right */}
+              <text
+                x={ROW_LABEL_W + chunk_tokens.length * CELL + 6}
+                y={COL_LABEL_H + r * CELL + CELL / 2 + 4}
+                fontSize={10}
+                fill="#fbbf24"
+              >+{(sim_matrix[r]?.[maxSimCols[r]] ?? 0).toFixed(3)}</text>
+            </g>
+          ))}
+
+          {/* ColBERT total score */}
+          <text
+            x={ROW_LABEL_W + chunk_tokens.length * CELL + 6}
+            y={COL_LABEL_H + query_tokens.length * CELL + 20}
+            fontSize={11}
+            fontWeight={700}
+            fill="#fbbf24"
+          >= {colbertScore.toFixed(3)}</text>
+        </svg>
+      </div>
+
+      <div className="flex items-center gap-3 text-xs text-zinc-500">
+        <span className="flex items-center gap-1.5">
+          <span className="inline-block w-3 h-3 rounded-sm border-2 border-amber-400" style={{ background: 'transparent' }} />
+          MaxSim per query token
+        </span>
+        <span className="flex items-center gap-1.5">
+          <span className="inline-block w-3 h-3 rounded-sm" style={{ background: 'rgb(251,191,36)' }} />
+          High similarity
+        </span>
+        <span className="flex items-center gap-1.5">
+          <span className="inline-block w-3 h-3 rounded-sm" style={{ background: 'rgb(24,24,27)' }} />
+          Low similarity
+        </span>
+      </div>
+
+      {topChunk && (
+        <div className="rounded-lg bg-zinc-800/60 border border-amber-500/20 px-4 py-3 text-xs text-zinc-400">
+          <span className="text-amber-400 font-semibold mr-2">Top re-ranked chunk:</span>
+          {topChunk.text.slice(0, 200)}{topChunk.text.length > 200 ? '…' : ''}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── Main page ─────────────────────────────────────────────────────────────────
 export default function Home() {
   const [text, setText] = useState(SAMPLE_TEXT)
@@ -256,6 +425,14 @@ export default function Home() {
   const [mrlDims, setMrlDims] = useState(768)
   const [traversalStep, setTraversalStep] = useState(-1)
   const indexSectionRef = useRef<HTMLDivElement>(null)
+
+  // ── Retrieval stage ──
+  const [retrieveQuery, setRetrieveQuery] = useState('')
+  const [retrieveLoading, setRetrieveLoading] = useState(false)
+  const [retrieveResult, setRetrieveResult] = useState<RetrieveResponse | null>(null)
+  const [retrieveError, setRetrieveError] = useState<string | null>(null)
+  const [retrieveTab, setRetrieveTab] = useState<'results' | 'shifts' | 'colbert'>('results')
+  const retrieveSectionRef = useRef<HTMLDivElement>(null)
 
   const overlapError = strategy !== 'semantic' && chunkOverlap >= chunkSize
     ? 'Overlap must be less than chunk size' : null
@@ -332,6 +509,24 @@ export default function Home() {
       setQueryResults(await res.json())
     } catch (e) { setQueryError(e instanceof Error ? e.message : 'Unknown error') }
     finally { setQueryLoading(false) }
+  }
+
+  async function handleRetrieve() {
+    if (!retrieveQuery.trim()) return
+    setRetrieveLoading(true); setRetrieveError(null)
+    try {
+      const res = await fetch('http://localhost:8000/api/retrieve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: retrieveQuery, k: 5, top_k_rerank: 20 }),
+      })
+      if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b?.detail ?? `Error ${res.status}`) }
+      const data: RetrieveResponse = await res.json()
+      setRetrieveResult(data)
+      setRetrieveTab('results')
+      setTimeout(() => retrieveSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100)
+    } catch (e) { setRetrieveError(e instanceof Error ? e.message : 'Unknown error') }
+    finally { setRetrieveLoading(false) }
   }
 
   async function handleCompare() {
@@ -1318,6 +1513,180 @@ export default function Home() {
           </main>
         </div>
       )}
+
+      {/* ══════════════════════════════════════════════════════════════════════
+          STAGE 4 — RETRIEVAL
+      ══════════════════════════════════════════════════════════════════════ */}
+      {embedResult && (
+        <div ref={retrieveSectionRef} className="border-t-2 border-zinc-800 mt-2">
+          <main className="max-w-6xl mx-auto px-6 py-8 space-y-6">
+
+            {/* Stage header */}
+            <div className="flex items-center gap-3">
+              <div className="w-7 h-7 rounded-md bg-violet-600 flex items-center justify-center text-xs font-bold">4</div>
+              <h2 className="text-lg font-semibold tracking-tight">Retrieval</h2>
+              <InfoTooltip
+                title="What is retrieval?"
+                body={"Retrieval is the step where your query meets your chunks.\n\nThe query is embedded with the same model used for chunks, then the index is searched for the most similar vectors. But 'most similar' depends on which strategy you use:\n\n• Dense — cosine similarity on embeddings. Great for semantic matches ('what causes fever' → finds 'pyrexia treatment' even with no shared words).\n• Sparse (BM25) — keyword frequency scoring, no embeddings. Great for exact matches: names, codes, rare terms.\n• Hybrid (RRF) — merge both ranked lists. Best of both worlds in practice.\n• Re-ranked — take the top-20 from hybrid, run a cross-encoder that reads both query and chunk together. Much more accurate but slower.\n\nThe improvement from left to right on this page is the standard production RAG stack."}
+                pos="top-right"
+              />
+              <span className="ml-auto text-xs text-zinc-600 font-mono">{embedResult.coords_2d.length} chunks</span>
+            </div>
+
+            {/* Query input */}
+            <div className="flex gap-3">
+              <input
+                value={retrieveQuery}
+                onChange={e => setRetrieveQuery(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && handleRetrieve()}
+                placeholder="Type a query to compare all four retrieval strategies…"
+                className="flex-1 rounded-xl bg-zinc-900 border border-zinc-700 px-4 py-2.5 text-sm text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-2 focus:ring-violet-600"
+              />
+              <button onClick={handleRetrieve} disabled={retrieveLoading || !retrieveQuery.trim()}
+                className="px-5 py-2.5 rounded-xl bg-violet-600 hover:bg-violet-500 disabled:opacity-40 text-sm font-semibold transition-colors whitespace-nowrap">
+                {retrieveLoading ? 'Retrieving…' : 'Retrieve →'}
+              </button>
+            </div>
+            {retrieveError && <div className="rounded-xl border border-red-800 bg-red-950/40 px-4 py-3 text-sm text-red-400">{retrieveError}</div>}
+            {retrieveLoading && (
+              <div className="rounded-xl bg-zinc-900 border border-zinc-800 px-5 py-10 text-center space-y-2">
+                <p className="text-sm text-zinc-400">Running all four strategies…</p>
+                <p className="text-xs text-zinc-600">First run downloads the cross-encoder model (~80 MB). Subsequent runs are fast.</p>
+              </div>
+            )}
+
+            {!retrieveResult && !retrieveLoading && (
+              <div className="rounded-xl bg-zinc-900 border border-zinc-800 px-5 py-10 text-center text-sm text-zinc-600">
+                Enter a query to compare Dense · BM25 · Hybrid · Re-ranked side by side
+              </div>
+            )}
+
+            {retrieveResult && (
+              <div className="space-y-6">
+                {/* Tab bar */}
+                <div className="flex items-center gap-1 rounded-xl bg-zinc-900 border border-zinc-800 p-1 w-fit">
+                  {([['results', 'Results'], ['shifts', 'Rank Shifts'], ['colbert', 'ColBERT ✦']] as [typeof retrieveTab, string][]).map(([id, label]) => (
+                    <button key={id} onClick={() => setRetrieveTab(id)}
+                      className={`px-4 py-1.5 rounded-lg text-sm font-semibold transition-colors ${retrieveTab === id ? 'bg-violet-600 text-white' : 'text-zinc-500 hover:text-zinc-300'}`}>
+                      {label}
+                    </button>
+                  ))}
+                </div>
+
+                {/* ── RESULTS TAB ── */}
+                {retrieveTab === 'results' && (
+                  <div className="grid grid-cols-4 gap-3">
+                    {([
+                      { key: 'dense',    label: 'Dense',        sublabel: 'cosine similarity',  color: 'sky',    results: retrieveResult.dense,    scoreLabel: 'cos',
+                        tip: 'Embeds the query and computes cosine similarity against every chunk vector. Finds semantically similar chunks even when no words overlap.\n\nStrength: semantic matching.\nWeakness: struggles with exact keywords, rare terms, names.' },
+                      { key: 'sparse',   label: 'Sparse',       sublabel: 'BM25 keyword score', color: 'emerald', results: retrieveResult.sparse,  scoreLabel: 'BM25',
+                        tip: 'BM25 — no embeddings, no neural network. Scores chunks by how often your query terms appear (weighted by how rare they are globally).\n\nStrength: exact keyword matching — names, codes, rare terms.\nWeakness: misses synonyms and paraphrases entirely.' },
+                      { key: 'hybrid',   label: 'Hybrid',       sublabel: 'RRF fusion',         color: 'violet', results: retrieveResult.hybrid,   scoreLabel: 'RRF',
+                        tip: 'Reciprocal Rank Fusion: merge the dense and sparse ranked lists. Each chunk scores 1/(60 + rank) from each list. Chunks that rank high in both get boosted.\n\nThis is the production standard — outperforms either strategy alone on most queries.' },
+                      { key: 'reranked', label: 'Re-ranked',    sublabel: 'cross-encoder',      color: 'amber',  results: retrieveResult.reranked, scoreLabel: 'CE',
+                        tip: 'Takes the top-20 candidates from hybrid and re-scores each one with a cross-encoder.\n\nA cross-encoder reads the query and chunk *together* in one forward pass — no separate query/chunk vectors. It can model the relationship between them directly, giving much more accurate scores.\n\nThe tradeoff: you can\'t pre-compute cross-encoder scores like you can embeddings. They must be computed fresh per query, so this is slow at scale — hence run it on a small candidate set only.' },
+                    ] as const).map(({ key, label, sublabel, color, results, scoreLabel, tip }) => {
+                      const ring: Record<string, string> = { sky: 'border-sky-500/30', emerald: 'border-emerald-500/30', violet: 'border-violet-500/30', amber: 'border-amber-500/30' }
+                      const hdr: Record<string, string>  = { sky: 'text-sky-400', emerald: 'text-emerald-400', violet: 'text-violet-400', amber: 'text-amber-400' }
+                      const dot: Record<string, string>  = { sky: 'bg-sky-500/60', emerald: 'bg-emerald-500/60', violet: 'bg-violet-500/60', amber: 'bg-amber-500/60' }
+                      return (
+                        <div key={key} className={`rounded-xl bg-zinc-900 border ${ring[color]} p-3 space-y-2`}>
+                          <div className="flex items-center gap-1.5">
+                            <div className={`w-2 h-2 rounded-full ${dot[color]}`} />
+                            <span className={`text-xs font-bold uppercase tracking-wide ${hdr[color]}`}>{label}</span>
+                            <InfoTooltip title={label} body={tip} />
+                            <span className="text-[10px] text-zinc-600 ml-auto">{sublabel}</span>
+                          </div>
+                          {results.map((r, rank) => (
+                            <div key={r.idx} className="rounded-lg bg-zinc-800/60 px-2.5 py-2 space-y-1">
+                              <div className="flex items-center gap-1.5">
+                                <span className={`text-[10px] font-bold font-mono ${hdr[color]}`}>#{rank + 1}</span>
+                                <span className="text-[10px] text-zinc-600 ml-auto font-mono">{scoreLabel} {r.score.toFixed(3)}</span>
+                              </div>
+                              <p className="text-xs text-zinc-400 leading-relaxed line-clamp-3">{r.text}</p>
+                            </div>
+                          ))}
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
+
+                {/* ── RANK SHIFTS TAB ── */}
+                {retrieveTab === 'shifts' && (
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2">
+                      <p className="text-xs font-medium text-zinc-400 uppercase tracking-wider">Rank shifts — same chunks, four strategies</p>
+                      <InfoTooltip
+                        title="How to read rank shifts"
+                        body={"Each row is a chunk that appeared in at least one strategy's top-5.\n\nThe columns show its rank in each strategy (1 = best). A dash means it didn't make the top-5 for that strategy.\n\nLook for big jumps: a chunk ranked #4 in dense that jumps to #1 in re-ranked means the cross-encoder found a strong query-chunk relationship that cosine similarity alone missed.\n\nHybrid often bridges the gap between dense (semantic) and sparse (keyword), and re-ranking makes the final call."}
+                        pos="top-right"
+                      />
+                    </div>
+                    <div className="rounded-xl bg-zinc-900 border border-zinc-800 overflow-hidden">
+                      <table className="w-full text-xs">
+                        <thead>
+                          <tr className="border-b border-zinc-800 text-zinc-500 uppercase tracking-wider">
+                            <th className="text-left px-4 py-3">Chunk</th>
+                            <th className="text-center px-3 py-3 text-sky-500/70">Dense</th>
+                            <th className="text-center px-3 py-3 text-emerald-500/70">Sparse</th>
+                            <th className="text-center px-3 py-3 text-violet-500/70">Hybrid</th>
+                            <th className="text-center px-3 py-3 text-amber-500/70">Re-ranked</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {retrieveResult.rank_shifts.map((s) => {
+                            const rankCell = (r: number | null, col: string) => {
+                              if (r === null) return <td key={col} className="text-center px-3 py-2.5 text-zinc-700">—</td>
+                              const bg = r === 1 ? 'bg-amber-500/20 text-amber-300 font-bold' : r <= 3 ? 'text-zinc-300' : 'text-zinc-600'
+                              return <td key={col} className={`text-center px-3 py-2.5 font-mono ${bg}`}>#{r}</td>
+                            }
+                            return (
+                              <tr key={s.idx} className="border-b border-zinc-800/50 hover:bg-zinc-800/20 transition-colors">
+                                <td className="px-4 py-2.5 text-zinc-400 max-w-xs">
+                                  <span className="text-zinc-600 font-mono mr-2">#{s.idx + 1}</span>
+                                  <span className="line-clamp-1">{s.text}</span>
+                                </td>
+                                {rankCell(s.dense_rank, 'dense')}
+                                {rankCell(s.sparse_rank, 'sparse')}
+                                {rankCell(s.hybrid_rank, 'hybrid')}
+                                {rankCell(s.reranked_rank, 'reranked')}
+                              </tr>
+                            )
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+
+                {/* ── COLBERT TAB ── */}
+                {retrieveTab === 'colbert' && (
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2">
+                      <p className="text-xs font-medium text-zinc-400 uppercase tracking-wider">ColBERT — late interaction</p>
+                      <InfoTooltip
+                        title="ColBERT late interaction"
+                        body={"Standard dense retrieval collapses an entire chunk into one vector. ColBERT keeps a separate embedding for every token.\n\nAt search time, for each query token it finds the most similar chunk token (MaxSim). The ColBERT score is the sum of these per-token maximums.\n\nThis is 'late interaction' — the query and chunk don't interact at encode time, only at score time. It's more expressive than a single vector but faster than a cross-encoder because chunk token embeddings can be pre-computed.\n\nThe heatmap below shows the full similarity matrix. Gold cells are the MaxSim winner for each query token — the strongest token-level match driving the score."}
+                        pos="top-right"
+                      />
+                    </div>
+                    {retrieveResult.colbert ? (
+                      <ColBERTHeatmap data={retrieveResult.colbert} topChunk={retrieveResult.reranked[0]} />
+                    ) : (
+                      <div className="rounded-xl bg-zinc-900 border border-zinc-800 px-5 py-10 text-center text-sm text-zinc-600">
+                        ColBERT token embeddings are not available for this model configuration.
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+          </main>
+        </div>
+      )}
+
     </div>
   )
 }

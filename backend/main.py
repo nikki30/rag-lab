@@ -253,10 +253,36 @@ EMBED_MODELS: dict[str, str] = {
 # Cache loaded models so we don't reload on every request
 _model_cache: dict[str, object] = {}
 
-# ── Stage 3 state ─────────────────────────────────────────────────────────────
-# Populated by /api/embed, consumed by /api/build-index and /api/query-index
+# ── Stage 3 & 4 state ─────────────────────────────────────────────────────────
+# Populated by /api/embed, consumed by /api/build-index, /api/query-index, /api/retrieve
 _embed_store: dict = {"vectors": None, "chunks": None, "model": None, "pca": None}
 _index_store: dict = {"hnsw": None, "hnsw_meta": None, "ivf_km": None, "ivf_assignments": None, "ivf_centroids_2d": None}
+
+# Lazy cross-encoder for Stage 4 re-ranking (~80 MB, downloaded once)
+_cross_encoder = None
+
+def get_cross_encoder():
+    global _cross_encoder
+    if _cross_encoder is None:
+        from sentence_transformers.cross_encoder import CrossEncoder
+        _cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", max_length=512)
+    return _cross_encoder
+
+
+def _encode_tokens(model_obj, text: str, max_tokens: int = 40) -> tuple[list[str], np.ndarray]:
+    """Per-token embeddings for ColBERT late interaction.
+    Returns (token_strings, embeddings [seq_len, hidden_dim]) with CLS/SEP stripped."""
+    import torch
+    tokenizer = model_obj.tokenizer
+    encoded = tokenizer(text, return_tensors="pt", truncation=True,
+                        max_length=max_tokens + 2, padding=False)
+    input_ids = encoded["input_ids"][0]
+    tokens = [tokenizer.decode([tid]).strip() for tid in input_ids[1:-1]]
+    with torch.no_grad():
+        out = model_obj[0].auto_model(**{k: v for k, v in encoded.items()})
+    embeds = out.last_hidden_state[0, 1:-1].cpu().numpy()
+    norms = np.linalg.norm(embeds, axis=1, keepdims=True)
+    return tokens, embeds / np.maximum(norms, 1e-8)
 
 def get_model(model_id: EmbedModelId):
     if model_id not in _model_cache:
@@ -656,4 +682,122 @@ async def query_index(request: QueryIndexRequest):
         "ivf_recall": ivf_recall,
         "ivf_searched_clusters": ivf_searched,
         "mrl": mrl,
+    }
+
+
+# ── Stage 4: Retrieval ────────────────────────────────────────────────────────
+
+class RetrieveRequest(BaseModel):
+    query: str
+    k: int = 5
+    top_k_rerank: int = 20  # candidates passed to cross-encoder before final top-k
+
+
+@app.post("/api/retrieve")
+async def retrieve(request: RetrieveRequest):
+    if _embed_store["vectors"] is None:
+        raise HTTPException(status_code=400, detail="No vectors — run /api/embed first")
+
+    vectors: np.ndarray = _embed_store["vectors"]
+    chunks: list[str] = _embed_store["chunks"]
+    model_id: str = _embed_store["model"]
+    n = len(chunks)
+    k = min(request.k, n)
+    top_k = min(request.top_k_rerank, n)
+
+    # ── Embed query ───────────────────────────────────────────────────────
+    model = get_model(model_id)
+    prefix = "search_query: " if model_id == "nomic" else ""
+    query_vec: np.ndarray = model.encode([prefix + request.query], normalize_embeddings=True)[0]
+
+    # ── Dense (cosine) ────────────────────────────────────────────────────
+    dense_sims = (vectors @ query_vec).tolist()
+    dense_order = sorted(range(n), key=lambda i: -dense_sims[i])
+    dense_results = [{"idx": i, "score": round(dense_sims[i], 4), "text": chunks[i]}
+                     for i in dense_order[:k]]
+
+    # ── Sparse (BM25) ─────────────────────────────────────────────────────
+    from rank_bm25 import BM25Okapi
+    tokenized_corpus = [re.findall(r"\w+", c.lower()) for c in chunks]
+    bm25 = BM25Okapi(tokenized_corpus)
+    q_tokens_bm25 = re.findall(r"\w+", request.query.lower())
+    bm25_scores = bm25.get_scores(q_tokens_bm25).tolist()
+    sparse_order = sorted(range(n), key=lambda i: -bm25_scores[i])
+    sparse_results = [{"idx": i, "score": round(bm25_scores[i], 4), "text": chunks[i]}
+                      for i in sparse_order[:k]]
+
+    # ── Hybrid (RRF) ──────────────────────────────────────────────────────
+    rrf_k = 60
+    rrf_scores: dict[int, float] = {}
+    for rank, idx in enumerate(dense_order[:top_k]):
+        rrf_scores[idx] = rrf_scores.get(idx, 0) + 1 / (rrf_k + rank + 1)
+    for rank, idx in enumerate(sparse_order[:top_k]):
+        rrf_scores[idx] = rrf_scores.get(idx, 0) + 1 / (rrf_k + rank + 1)
+    hybrid_order = sorted(rrf_scores, key=lambda i: -rrf_scores[i])
+    hybrid_results = [{"idx": i, "score": round(rrf_scores[i], 6), "text": chunks[i]}
+                      for i in hybrid_order[:k]]
+
+    # ── Cross-encoder re-ranking ──────────────────────────────────────────
+    # Candidates = union of top-top_k from all three strategies (deduped)
+    seen: set[int] = set()
+    candidates: list[int] = []
+    for idx in hybrid_order[:top_k] + dense_order[:top_k] + sparse_order[:top_k]:
+        if idx not in seen:
+            seen.add(idx)
+            candidates.append(idx)
+    ce = get_cross_encoder()
+    ce_pairs = [[request.query, chunks[i]] for i in candidates]
+    ce_scores_arr = ce.predict(ce_pairs).tolist()
+    ce_ranked = sorted(zip(candidates, ce_scores_arr), key=lambda x: -x[1])
+    reranked_results = [{"idx": i, "score": round(s, 4), "text": chunks[i]}
+                        for i, s in ce_ranked[:k]]
+
+    # ── ColBERT late interaction (top re-ranked chunk) ────────────────────
+    colbert_data = None
+    if reranked_results:
+        try:
+            top_idx = reranked_results[0]["idx"]
+            q_toks, q_embeds = _encode_tokens(model, request.query, max_tokens=24)
+            c_toks, c_embeds = _encode_tokens(model, chunks[top_idx], max_tokens=48)
+            sim_matrix = (q_embeds @ c_embeds.T).tolist()
+            colbert_data = {
+                "query_tokens": q_toks,
+                "chunk_tokens": c_toks,
+                "sim_matrix": sim_matrix,
+                "chunk_idx": top_idx,
+            }
+        except Exception:
+            pass
+
+    # ── Rank shift table ──────────────────────────────────────────────────
+    all_top = list(dict.fromkeys(
+        [r["idx"] for r in dense_results] + [r["idx"] for r in sparse_results] +
+        [r["idx"] for r in hybrid_results] + [r["idx"] for r in reranked_results]
+    ))
+
+    def rank_in(idx: int, results: list[dict]) -> int | None:
+        for pos, r in enumerate(results):
+            if r["idx"] == idx:
+                return pos + 1
+        return None
+
+    rank_shifts = [
+        {
+            "idx": idx,
+            "text": chunks[idx][:100],
+            "dense_rank": rank_in(idx, dense_results),
+            "sparse_rank": rank_in(idx, sparse_results),
+            "hybrid_rank": rank_in(idx, hybrid_results),
+            "reranked_rank": rank_in(idx, reranked_results),
+        }
+        for idx in all_top
+    ]
+
+    return {
+        "dense": dense_results,
+        "sparse": sparse_results,
+        "hybrid": hybrid_results,
+        "reranked": reranked_results,
+        "colbert": colbert_data,
+        "rank_shifts": rank_shifts,
     }
