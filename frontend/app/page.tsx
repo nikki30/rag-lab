@@ -1563,9 +1563,35 @@ export default function Home() {
 
             {retrieveResult && (
               <div className="space-y-6">
+
+                {/* Pipeline flow banner */}
+                <div className="rounded-xl bg-zinc-900 border border-zinc-800 px-5 py-3.5 flex items-center gap-2 text-xs flex-wrap">
+                  <span className="text-zinc-500 font-medium uppercase tracking-wider">Pipeline</span>
+                  <span className="text-zinc-700 mx-1">—</span>
+                  <span className="px-2 py-0.5 rounded-md bg-sky-500/10 border border-sky-500/20 text-sky-400 font-semibold">Dense</span>
+                  <span className="text-zinc-700">+</span>
+                  <span className="px-2 py-0.5 rounded-md bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 font-semibold">Sparse</span>
+                  <span className="text-zinc-600 text-[10px] italic">find candidates independently</span>
+                  <span className="text-zinc-700 mx-1">→</span>
+                  <span className="px-2 py-0.5 rounded-md bg-violet-500/10 border border-violet-500/20 text-violet-400 font-semibold">Hybrid RRF</span>
+                  <span className="text-zinc-600 text-[10px] italic">merge both ranked lists</span>
+                  <span className="text-zinc-700 mx-1">→</span>
+                  <span className="px-2 py-0.5 rounded-md bg-amber-500/10 border border-amber-500/20 text-amber-400 font-semibold">Re-rank</span>
+                  <span className="text-zinc-600 text-[10px] italic">score top-20 more carefully</span>
+                  <InfoTooltip
+                    title="Two-phase pipeline"
+                    body={"Retrieval and re-ranking are different jobs.\n\nPHASE 1 — RETRIEVAL: find candidate chunks fast.\n• Dense: embed query → cosine similarity against all chunk vectors. Finds semantic matches ('fever' → 'pyrexia') even with no shared words.\n• Sparse (BM25): no embeddings, pure keyword frequency. Finds exact term matches that dense might miss.\n• Hybrid (RRF): merge both ranked lists. Chunks that rank high in both get boosted. This is the production standard.\n\nPHASE 2 — RE-RANKING: take the top-20 candidates from hybrid and score them more accurately.\n• Cross-encoder: reads the query and chunk *together* in one forward pass. Far more accurate than cosine between two separate vectors, but too slow to run on the whole corpus — only used on the small candidate set.\n\nThe output score from cross-encoder is not cosine — it's a learned relevance logit from a model trained on (query, relevant chunk) / (query, irrelevant chunk) pairs."}
+                    pos="top-left"
+                  />
+                </div>
+
                 {/* Tab bar */}
                 <div className="flex items-center gap-1 rounded-xl bg-zinc-900 border border-zinc-800 p-1 w-fit">
-                  {([['results', 'Results'], ['shifts', 'Rank Shifts'], ['colbert', 'ColBERT ✦']] as [typeof retrieveTab, string][]).map(([id, label]) => (
+                  {([
+                    ['results', 'Results'],
+                    ['shifts',  'Rank Shifts'],
+                    ['colbert', 'ColBERT ✦'],
+                  ] as [typeof retrieveTab, string][]).map(([id, label]) => (
                     <button key={id} onClick={() => setRetrieveTab(id)}
                       className={`px-4 py-1.5 rounded-lg text-sm font-semibold transition-colors ${retrieveTab === id ? 'bg-violet-600 text-white' : 'text-zinc-500 hover:text-zinc-300'}`}>
                       {label}
@@ -1575,40 +1601,91 @@ export default function Home() {
 
                 {/* ── RESULTS TAB ── */}
                 {retrieveTab === 'results' && (
-                  <div className="grid grid-cols-4 gap-3">
-                    {([
-                      { key: 'dense',    label: 'Dense',        sublabel: 'cosine similarity',  color: 'sky',    results: retrieveResult.dense,    scoreLabel: 'cos',
-                        tip: 'Embeds the query and computes cosine similarity against every chunk vector. Finds semantically similar chunks even when no words overlap.\n\nStrength: semantic matching.\nWeakness: struggles with exact keywords, rare terms, names.' },
-                      { key: 'sparse',   label: 'Sparse',       sublabel: 'BM25 keyword score', color: 'emerald', results: retrieveResult.sparse,  scoreLabel: 'BM25',
-                        tip: 'BM25 — no embeddings, no neural network. Scores chunks by how often your query terms appear (weighted by how rare they are globally).\n\nStrength: exact keyword matching — names, codes, rare terms.\nWeakness: misses synonyms and paraphrases entirely.' },
-                      { key: 'hybrid',   label: 'Hybrid',       sublabel: 'RRF fusion',         color: 'violet', results: retrieveResult.hybrid,   scoreLabel: 'RRF',
-                        tip: 'Reciprocal Rank Fusion: merge the dense and sparse ranked lists. Each chunk scores 1/(60 + rank) from each list. Chunks that rank high in both get boosted.\n\nThe actual cosine and BM25 scores are thrown away — only rank position matters. This avoids the problem that cosine (0–1) and BM25 (unbounded) live on incompatible scales.\n\nWhy 60? Empirically chosen in the original 2009 paper. It dampens the difference between rank 1 and rank 2 so the top results get similar weight rather than a sharp cliff. Values from 10–100 all behave similarly.\n\nWhy not just average the ranks? Two reasons:\n• Missing chunks: most chunks appear in only one list. You\'d need to invent a penalty rank for the other — that number dominates the average. RRF treats missing as +0 with no arbitrary penalty.\n• Equal spacing is wrong: the gap between rank 1 and 2 is far more meaningful than rank 49 vs 50. Reciprocal rank compresses the bottom naturally.\n\nWhy "dense" doesn\'t mean cosine specifically: dense = the retrieval uses a dense vector (every dimension carries information). Cosine is just the most common distance function used with text embeddings. You could also use dot product or L2 — for normalised vectors (which sentence-transformers always produces), cosine and dot product give identical results.' },
-                      { key: 'reranked', label: 'Re-ranked',    sublabel: 'cross-encoder',      color: 'amber',  results: retrieveResult.reranked, scoreLabel: 'CE',
-                        tip: 'Takes the top-20 candidates from hybrid and re-scores each one with a cross-encoder.\n\nA cross-encoder reads the query and chunk *together* in one forward pass — no separate query/chunk vectors. It can model the relationship between them directly, giving much more accurate scores.\n\nThe tradeoff: you can\'t pre-compute cross-encoder scores like you can embeddings. They must be computed fresh per query, so this is slow at scale — hence run it on a small candidate set only.' },
-                    ] as const).map(({ key, label, sublabel, color, results, scoreLabel, tip }) => {
-                      const ring: Record<string, string> = { sky: 'border-sky-500/30', emerald: 'border-emerald-500/30', violet: 'border-violet-500/30', amber: 'border-amber-500/30' }
-                      const hdr: Record<string, string>  = { sky: 'text-sky-400', emerald: 'text-emerald-400', violet: 'text-violet-400', amber: 'text-amber-400' }
-                      const dot: Record<string, string>  = { sky: 'bg-sky-500/60', emerald: 'bg-emerald-500/60', violet: 'bg-violet-500/60', amber: 'bg-amber-500/60' }
-                      return (
-                        <div key={key} className={`rounded-xl bg-zinc-900 border ${ring[color]} p-3 space-y-2`}>
-                          <div className="flex items-center gap-1.5">
-                            <div className={`w-2 h-2 rounded-full ${dot[color]}`} />
-                            <span className={`text-xs font-bold uppercase tracking-wide ${hdr[color]}`}>{label}</span>
-                            <InfoTooltip title={label} body={tip} />
-                            <span className="text-[10px] text-zinc-600 ml-auto">{sublabel}</span>
-                          </div>
-                          {results.map((r, rank) => (
-                            <div key={r.idx} className="rounded-lg bg-zinc-800/60 px-2.5 py-2 space-y-1">
-                              <div className="flex items-center gap-1.5">
-                                <span className={`text-[10px] font-bold font-mono ${hdr[color]}`}>#{rank + 1}</span>
-                                <span className="text-[10px] text-zinc-600 ml-auto font-mono">{scoreLabel} {r.score.toFixed(3)}</span>
+                  <div className="space-y-3">
+                    {/* Phase 1 label */}
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] font-bold uppercase tracking-widest text-zinc-600">Phase 1 — Retrieval</span>
+                      <div className="flex-1 h-px bg-zinc-800" />
+                      <span className="text-[10px] text-zinc-700">find candidates from the full corpus</span>
+                    </div>
+
+                    <div className="grid grid-cols-3 gap-3">
+                      {([
+                        { key: 'dense',  label: 'Dense',  tagline: 'semantic vector search', sublabel: 'cosine similarity', color: 'sky',     results: retrieveResult.dense,  scoreLabel: 'cos',
+                          tip: 'RETRIEVAL — searches the whole corpus.\n\nEmbeds the query with the same model used for chunks, then computes cosine similarity against every chunk vector. Finds semantically similar chunks even when no words overlap ("fever" → "pyrexia").\n\n"Dense" means the vectors are dense — every dimension carries information. Cosine is just the most common distance function; for unit-normalised vectors (which sentence-transformers always produces) cosine and dot product give identical results.\n\nStrength: semantic matching, paraphrase handling.\nWeakness: struggles with exact keywords, rare terms, proper names.' },
+                        { key: 'sparse', label: 'Sparse', tagline: 'exact keyword matching',  sublabel: 'BM25',              color: 'emerald', results: retrieveResult.sparse, scoreLabel: 'BM25',
+                          tip: 'RETRIEVAL — searches the whole corpus.\n\nBM25 — no embeddings, no neural network. Scores chunks by how often your query terms appear, weighted by how rare they are globally (rare terms score higher).\n\nStrength: exact keyword matching — names, codes, rare terms, anything that needs to match literally.\nWeakness: misses synonyms and paraphrases entirely. "Fever" will not match "pyrexia".' },
+                        { key: 'hybrid', label: 'Hybrid', tagline: 'best of both via RRF',    sublabel: 'RRF fusion',        color: 'violet',  results: retrieveResult.hybrid, scoreLabel: 'RRF',
+                          tip: 'RETRIEVAL — merges dense and sparse results.\n\nReciprocal Rank Fusion: each chunk scores 1/(60 + rank) from the dense list and 1/(60 + rank) from the sparse list. Chunks that rank high in both get the highest combined score.\n\nThe raw cosine and BM25 values are thrown away — only rank position matters. This sidesteps the problem that cosine (0–1) and BM25 (unbounded) live on incompatible scales.\n\nWhy reciprocal? Inverse relationship: rank 1 should score more than rank 2, which more than rank 3. Why 60? Flattens the curve so rank 1 vs 2 don\'t differ wildly — 10–100 all behave similarly.\n\nThis is the production standard — outperforms either strategy alone on most queries.' },
+                      ] as const).map(({ key, label, tagline, sublabel, color, results, scoreLabel, tip }) => {
+                        const ring: Record<string, string> = { sky: 'border-sky-500/30', emerald: 'border-emerald-500/30', violet: 'border-violet-500/30' }
+                        const hdr: Record<string, string>  = { sky: 'text-sky-400', emerald: 'text-emerald-400', violet: 'text-violet-400' }
+                        const dot: Record<string, string>  = { sky: 'bg-sky-500/60', emerald: 'bg-emerald-500/60', violet: 'bg-violet-500/60' }
+                        return (
+                          <div key={key} className={`rounded-xl bg-zinc-900 border ${ring[color]} p-3 space-y-2`}>
+                            <div className="flex items-start gap-1.5">
+                              <div className={`w-2 h-2 rounded-full mt-1 shrink-0 ${dot[color]}`} />
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center gap-1">
+                                  <span className={`text-xs font-bold uppercase tracking-wide ${hdr[color]}`}>{label}</span>
+                                  <InfoTooltip title={label} body={tip} />
+                                </div>
+                                <p className="text-[10px] text-zinc-600 mt-0.5">{tagline}</p>
                               </div>
-                              <p className="text-xs text-zinc-400 leading-relaxed line-clamp-3">{r.text}</p>
+                              <span className="text-[10px] text-zinc-700 font-mono shrink-0">{sublabel}</span>
                             </div>
-                          ))}
+                            {results.map((r, rank) => (
+                              <div key={r.idx} className="rounded-lg bg-zinc-800/60 px-2.5 py-2 space-y-1">
+                                <div className="flex items-center gap-1.5">
+                                  <span className={`text-[10px] font-bold font-mono ${hdr[color]}`}>#{rank + 1}</span>
+                                  <span className="text-[10px] text-zinc-600 ml-auto font-mono">{scoreLabel} {r.score.toFixed(3)}</span>
+                                </div>
+                                <p className="text-xs text-zinc-400 leading-relaxed line-clamp-3">{r.text}</p>
+                              </div>
+                            ))}
+                          </div>
+                        )
+                      })}
+                    </div>
+
+                    {/* Phase 2 label */}
+                    <div className="flex items-center gap-2 pt-2">
+                      <span className="text-[10px] font-bold uppercase tracking-widest text-zinc-600">Phase 2 — Re-ranking</span>
+                      <div className="flex-1 h-px bg-zinc-800" />
+                      <span className="text-[10px] text-zinc-700">score top-20 hybrid candidates more accurately</span>
+                    </div>
+
+                    <div className="grid grid-cols-1 gap-3">
+                      {([
+                        { key: 'reranked', label: 'Re-ranked', tagline: 'cross-encoder reads query + chunk together', sublabel: 'cross-encoder', color: 'amber', results: retrieveResult.reranked, scoreLabel: 'CE',
+                          tip: 'RE-RANKING — runs on the top-20 hybrid candidates only, not the whole corpus.\n\nDense retrieval encodes query and chunk separately, then compares two fixed vectors with cosine. The query and chunk never see each other during encoding.\n\nA cross-encoder takes them together as one input:\n[query] [SEP] [chunk] → full transformer forward pass → one relevance score\n\n[SEP] is a special separator token that tells the model "query ends here, chunk begins here." Every query token attends to every chunk token through the full attention mechanism — it can find that "caused" in the chunk directly answers "what causes" in the query.\n\nThe output score is not cosine — it\'s a learned relevance number from a model trained on (query, relevant chunk) vs (query, irrelevant chunk) pairs. Only use it for ranking, not as an absolute value.\n\nThe tradeoff: you cannot pre-compute cross-encoder scores. Every query requires a fresh forward pass per candidate. This is why it only runs on a small candidate set.' },
+                      ] as const).map(({ key, label, tagline, sublabel, color, results, scoreLabel, tip }) => (
+                        <div key={key} className="rounded-xl bg-zinc-900 border border-amber-500/30 p-3 space-y-2">
+                          <div className="flex items-start gap-1.5">
+                            <div className="w-2 h-2 rounded-full mt-1 shrink-0 bg-amber-500/60" />
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center gap-1">
+                                <span className="text-xs font-bold uppercase tracking-wide text-amber-400">{label}</span>
+                                <InfoTooltip title={label} body={tip} />
+                              </div>
+                              <p className="text-[10px] text-zinc-600 mt-0.5">{tagline}</p>
+                            </div>
+                            <span className="text-[10px] text-zinc-700 font-mono shrink-0">{sublabel}</span>
+                          </div>
+                          <div className="grid grid-cols-3 gap-2">
+                            {results.map((r, rank) => (
+                              <div key={r.idx} className="rounded-lg bg-zinc-800/60 px-2.5 py-2 space-y-1">
+                                <div className="flex items-center gap-1.5">
+                                  <span className="text-[10px] font-bold font-mono text-amber-400">#{rank + 1}</span>
+                                  <span className="text-[10px] text-zinc-600 ml-auto font-mono">{scoreLabel} {r.score.toFixed(3)}</span>
+                                </div>
+                                <p className="text-xs text-zinc-400 leading-relaxed line-clamp-3">{r.text}</p>
+                              </div>
+                            ))}
+                          </div>
                         </div>
-                      )
-                    })}
+                      ))}
+                    </div>
                   </div>
                 )}
 
@@ -1664,10 +1741,10 @@ export default function Home() {
                 {retrieveTab === 'colbert' && (
                   <div className="space-y-3">
                     <div className="flex items-center gap-2">
-                      <p className="text-xs font-medium text-zinc-400 uppercase tracking-wider">ColBERT — late interaction</p>
+                      <p className="text-xs font-medium text-zinc-400 uppercase tracking-wider">ColBERT — alternative re-ranking via late interaction</p>
                       <InfoTooltip
-                        title="ColBERT late interaction"
-                        body={"Standard dense retrieval collapses an entire chunk into one vector. ColBERT keeps a separate embedding for every token.\n\nAt search time, for each query token it finds the most similar chunk token (MaxSim). The ColBERT score is the sum of these per-token maximums.\n\nThis is 'late interaction' — the query and chunk don't interact at encode time, only at score time. It's more expressive than a single vector but faster than a cross-encoder because chunk token embeddings can be pre-computed.\n\nThe heatmap below shows the full similarity matrix. Gold cells are the MaxSim winner for each query token — the strongest token-level match driving the score."}
+                        title="ColBERT — an alternative to the cross-encoder"
+                        body={"Both ColBERT and cross-encoder are RE-RANKING methods — they score a small candidate set more carefully than dense retrieval can. They are different ways to solve the same problem.\n\nCross-encoder: reads query + chunk together in one forward pass. Most accurate, but nothing is pre-computable — every query needs a fresh forward pass per candidate.\n\nColBERT (late interaction): instead of one vector per chunk, stores one vector per chunk token. At query time, for each query token, find the chunk token most similar to it (MaxSim). Sum those per-token maximums → the ColBERT score. Chunk token vectors are pre-computed and stored; only the MaxSim lookup happens at query time.\n\nWhy 'late interaction'? The query and chunk don't interact at encode time — they're encoded separately. The interaction (which query token matches which chunk token) happens late, at score time.\n\nThe heatmap shows the full (query tokens × chunk tokens) similarity matrix. Gold outline = the MaxSim winner for that query token — the score that gets added to the total. The sum on the right is the ColBERT score.\n\nStorage cost: ColBERT stores ~100 tokens × 128 dims per chunk instead of 384 dims — roughly 33× more. This is why ColBERT is mostly research / high-stakes retrieval rather than standard production."}
                         pos="top-right"
                       />
                     </div>
