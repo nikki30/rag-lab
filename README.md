@@ -27,6 +27,7 @@ An interactive, local-first laboratory for exploring RAG pipeline decisions visu
 ## Reference notes
 
 - [`docs/indexing101.md`](docs/indexing101.md) — FAISS, HNSW, IVF, Flat explained with build vs query parameter breakdown
+- [`docs/retrieval101.md`](docs/retrieval101.md) — Dense, BM25, RRF hybrid, cross-encoder re-ranking, ColBERT late interaction
 
 ## Stack
 
