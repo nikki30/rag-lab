@@ -9,9 +9,9 @@ An interactive, local-first laboratory for exploring RAG pipeline decisions visu
 | **Chunking** | ✅ Done | Compare 5 strategies (recursive, fixed, paragraph, sentence, semantic), tune parameters, inspect per-chunk quality scores, and see topic-similarity between sentences on a live chart. Semantic chunking uses real MiniLM embeddings — threshold changes produce visibly different chunk boundaries. |
 | **Embedding** | ✅ Done | Embed chunks with 4 local models (MiniLM, BGE-Small, MPNet, Nomic), visualise the vector space with PCA / UMAP / PaCMAP, inspect the cosine similarity heatmap with chunking-issue detection, and explore raw vector values |
 | **Indexing** | ✅ Done | Build Flat / HNSW / IVF / MRL indexes over your embedded vectors. Visualise the real HNSW multilayer graph with layer-by-layer traversal, IVF cluster boundaries with nprobe selection, and MRL dimension-truncation recall table. Orange/green colour coding distinguishes index-rebuild vs query-only parameters. See `docs/indexing101.md` for concept notes. |
-| **Retrieval** | 🔜 Next | Type a query, embed it, and watch it find the nearest chunks — compare dense (cosine), sparse (BM25), and hybrid (Reciprocal Rank Fusion) side-by-side; experiment with HyDE and query decomposition |
-| **Reranking** | Planned | Cross-encoder reranking to re-score the top-k results more accurately; visualise rank shifts and explore ColBERT-style late interaction scoring |
-| **Generation** | Planned | Assemble retrieved chunks into a prompt, call a real LLM, and see faithfulness highlighting that shows which parts of the answer are grounded vs. likely hallucinated |
+| **Retrieval** | ✅ Done | Type a query, embed it, and watch it find the nearest chunks — compare dense (cosine), sparse (BM25), and hybrid (RRF) side-by-side. Experiment with HyDE (hypothetical document embedding) and query decomposition. See `docs/retrieval101.md`. |
+| **Reranking** | ✅ Done | Cross-encoder re-scores the top-k retrieval candidates with full query-chunk interaction. ColBERT late interaction shows token-level MaxSim heatmaps. Rank shift table compares all four strategies side-by-side. |
+| **Generation** | 🚧 In Progress | Select an LLM (Ollama local, Groq free tier, OpenAI, Anthropic), choose a compaction strategy (raw / contextual / LLMLingua), chunk ordering, and context strategy — then see the assembled prompt breakdown and grounding highlighting on the answer. |
 
 ### State-of-the-art concepts woven in throughout
 
@@ -26,8 +26,11 @@ An interactive, local-first laboratory for exploring RAG pipeline decisions visu
 
 ## Reference notes
 
+- [`docs/chunking101.md`](docs/chunking101.md) — 5 strategies compared, quality scores, hub chunks, σ, contextual chunking, late chunking
+- [`docs/embedding101.md`](docs/embedding101.md) — vectors, cosine similarity, MRL, PCA vs UMAP vs PaCMAP, heatmap interpretation
 - [`docs/indexing101.md`](docs/indexing101.md) — FAISS, HNSW, IVF, Flat explained with build vs query parameter breakdown
 - [`docs/retrieval101.md`](docs/retrieval101.md) — Dense, BM25, RRF hybrid, cross-encoder re-ranking, ColBERT late interaction
+- [`docs/generate101.md`](docs/generate101.md) — token budget problem, compaction algorithms, chunk ordering, context strategies
 
 ## Stack
 
