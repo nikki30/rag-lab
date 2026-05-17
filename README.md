@@ -1,6 +1,26 @@
-# RAG Lab
+<div align="center">
 
-An interactive, local-first laboratory for exploring RAG pipeline decisions visually. Pick a chunking strategy, embedding model, or retrieval algorithm and immediately see how each choice affects the output — no cloud dependencies, no abstractions hiding the mechanics.
+# 🔬 RAG Lab
+
+### Learn RAG by watching it work.
+
+**An interactive, local-first laboratory for every decision in a Retrieval-Augmented Generation pipeline — chunking, embedding, indexing, retrieval, reranking, generation, and evaluation. No abstractions, no cloud dependencies, every algorithm visualised in real time.**
+
+<br>
+
+![RAG Lab demo](docs/assets/RAGLABDemo.gif)
+
+<br>
+
+**[Pipeline stages](#pipeline-stages)** · **[Quick start](#running-locally)** · **[Concept guides](#reference-notes)** · **[SOTA concepts](#state-of-the-art-concepts-woven-in-throughout)**
+
+</div>
+
+<br>
+
+> **Why this exists.** Most RAG tutorials show you how to build a pipeline. RAG Lab shows you *why* each decision matters — with the real HNSW graph being traversed, the cosine similarity heatmap you can hover, the reranking shifts laid out side-by-side, and a final radar chart scoring the whole pipeline. Built for learning the field deeply, then teaching it.
+
+<br>
 
 ## Pipeline stages
 
@@ -13,6 +33,7 @@ An interactive, local-first laboratory for exploring RAG pipeline decisions visu
 | **Reranking** | ✅ Done | Cross-encoder re-scores the top-k retrieval candidates with full query-chunk interaction. ColBERT late interaction shows token-level MaxSim heatmaps. Rank shift table compares all four strategies side-by-side. |
 | **Generation** | ✅ Done | Select an LLM (Ollama local, Groq free tier, OpenAI, Anthropic), choose a compaction strategy (raw / contextual / LLMLingua), chunk ordering, and context strategy — then see the assembled prompt breakdown and grounding highlighting on the answer. |
 | **Evaluation** | ✅ Done | Score the full pipeline end-to-end with [RAGAS](https://docs.ragas.io)-style metrics — Faithfulness, Answer Relevancy, Context Precision, Context Recall, and Noise Sensitivity. Radar chart, sentence-level grounding breakdown, chunk relevance table, and optional ground truth recall. |
+
 ### State-of-the-art concepts woven in throughout
 
 | Concept | Stage |
