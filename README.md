@@ -12,6 +12,7 @@ An interactive, local-first laboratory for exploring RAG pipeline decisions visu
 | **Retrieval** | ✅ Done | Type a query, embed it, and watch it find the nearest chunks — compare dense (cosine), sparse (BM25), and hybrid (RRF) side-by-side. Experiment with HyDE (hypothetical document embedding) and query decomposition. See `docs/retrieval101.md`. |
 | **Reranking** | ✅ Done | Cross-encoder re-scores the top-k retrieval candidates with full query-chunk interaction. ColBERT late interaction shows token-level MaxSim heatmaps. Rank shift table compares all four strategies side-by-side. |
 | **Generation** | 🚧 In Progress | Select an LLM (Ollama local, Groq free tier, OpenAI, Anthropic), choose a compaction strategy (raw / contextual / LLMLingua), chunk ordering, and context strategy — then see the assembled prompt breakdown and grounding highlighting on the answer. |
+| **Evaluation** | 🔜 Next | Score the full pipeline end-to-end with [RAGAS](https://docs.ragas.io) metrics — Faithfulness (is the answer grounded in context?), Answer Relevancy (does the answer address the query?), Context Precision (are retrieved chunks actually relevant?), and Context Recall (did we retrieve everything needed?). Compare metric scores across different chunking strategies, retrieval configs, and models to understand which pipeline decisions actually move the needle. |
 
 ### State-of-the-art concepts woven in throughout
 
@@ -55,3 +56,22 @@ powershell -Command "Get-Process python* | Stop-Process -Force"
 ```
 
 > First run downloads models: embedding stage (~90–400 MB depending on model), semantic chunking stage (MiniLM, ~90 MB). Subsequent runs use the cached version.
+
+### Generation stage — LLM setup
+
+The Generation stage supports four providers. The easiest to get started with is **Ollama** (runs entirely locally, no API key, no cost):
+
+**Ollama (recommended for first run)**
+1. Download and install from [ollama.com](https://ollama.com)
+2. Pull the Llama 3.2 model:
+```bash
+ollama pull llama3.2
+```
+3. Ollama starts automatically — no separate server command needed. The model runs on your machine (~2 GB download).
+
+**Groq (free cloud tier)**
+1. Sign up at [console.groq.com](https://console.groq.com) — free tier, no credit card
+2. Create an API key and set it as `GROQ_API_KEY` in `backend/.env`
+
+**OpenAI / Anthropic**
+Set `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` in `backend/.env`.
