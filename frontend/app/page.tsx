@@ -168,6 +168,18 @@ const CONTEXT_STRATEGIES: { id: ContextStrategy; label: string; tagline: string;
     description: 'Each chunk generates its own candidate answer with a confidence score. The highest-confidence answer wins — no synthesis step.\n\nN LLM calls, parallelisable.\n\nBest for factoid QA where you expect the answer to live entirely within one chunk ("what is the CEO\'s name?"). Wastes calls if the answer requires combining evidence across multiple chunks — the synthesis step never happens.' },
 ]
 
+// ── Stage 6: Evaluate types ───────────────────────────────────────────────────
+interface SentenceScore { sentence: string; max_similarity: number; grounded: boolean; best_chunk_idx: number }
+interface ChunkRelevance { chunk_idx: number; preview: string; similarity: number; relevant: boolean; precision_at_k: number }
+interface GtSentenceScore { sentence: string; max_similarity: number; supported: boolean; best_chunk_idx: number }
+interface EvalResult {
+  faithfulness: number; answer_relevancy: number
+  context_precision: number; context_recall: number | null
+  noise_sensitivity: number
+  sentence_scores: SentenceScore[]; chunk_relevance: ChunkRelevance[]; gt_sentence_scores: GtSentenceScore[]
+  n_grounded: number; n_sentences: number; n_relevant_chunks: number; n_chunks: number; n_contributing_chunks: number
+}
+
 const EMBED_MODELS: EmbedModel[] = [
   { id: 'minilm',    label: 'MiniLM-L6',       dims: 384, speed: 'Fast',    tagline: 'Industry default',       description: 'The workhorse of local RAG. Small, fast, surprisingly good. 384 numbers per chunk. Best starting point.' },
   { id: 'bge-small', label: 'BGE-Small',        dims: 384, speed: 'Fast',    tagline: 'State-of-the-art small', description: 'BAAI\'s model beats MiniLM on retrieval benchmarks at the same size. Same speed, better recall. Current SOTA at 384d.' },
@@ -599,6 +611,13 @@ export default function Home() {
   const [apiKeyMissing, setApiKeyMissing] = useState(false)
   const generateSectionRef = useRef<HTMLDivElement>(null)
 
+  // ── Evaluate stage ──
+  const [evalGroundTruth, setEvalGroundTruth] = useState('')
+  const [evalResult, setEvalResult] = useState<EvalResult | null>(null)
+  const [evalLoading, setEvalLoading] = useState(false)
+  const [evalError, setEvalError] = useState<string | null>(null)
+  const evalSectionRef = useRef<HTMLDivElement>(null)
+
   // ── Retrieval stage ──
   const [retrieveQuery, setRetrieveQuery] = useState('')
   // Pre-fill Stage 4 query from Stage 3 when it first becomes non-empty
@@ -741,6 +760,30 @@ export default function Home() {
       setGenerateError(msg)
     }
     finally { setGenerateLoading(false) }
+  }
+
+  async function handleEvaluate() {
+    if (!generateResult || !retrieveResult) return
+    evalSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    setEvalLoading(true); setEvalError(null); setEvalResult(null)
+    try {
+      const res = await fetch('http://localhost:8000/api/evaluate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query: retrieveQuery,
+          answer: generateResult.answer,
+          chunks: retrieveResult.reranked.map(r => r.text),
+          ground_truth: evalGroundTruth.trim() || null,
+          embed_model: embedModel,
+        }),
+      })
+      if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b?.detail ?? `Error ${res.status}`) }
+      const data: EvalResult = await res.json()
+      setEvalResult(data)
+      setTimeout(() => evalSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100)
+    } catch (e) { setEvalError(e instanceof Error ? e.message : 'Unknown error') }
+    finally { setEvalLoading(false) }
   }
 
   async function handleCompare() {
@@ -2415,6 +2458,268 @@ export default function Home() {
               </div>
             )}
 
+            {/* ── Evaluate CTA — appears once answer exists ── */}
+            {generateResult && !generateLoading && (
+              <div className="flex items-center gap-4 rounded-xl border border-zinc-800 bg-zinc-900/60 px-5 py-4">
+                <div className="flex-1">
+                  <p className="text-sm font-semibold text-zinc-200">Ready to evaluate</p>
+                  <p className="text-xs text-zinc-500 mt-0.5">
+                    Score the full pipeline with RAGAS-style metrics — faithfulness, answer relevancy, context precision, and more.
+                  </p>
+                </div>
+                <button
+                  onClick={handleEvaluate}
+                  disabled={evalLoading}
+                  className="px-5 py-2 rounded-lg text-sm font-semibold transition-colors bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white whitespace-nowrap"
+                >
+                  {evalLoading ? 'Evaluating…' : 'Evaluate Pipeline →'}
+                </button>
+              </div>
+            )}
+
+          </main>
+        </div>
+      )}
+
+      {/* ══════════════════════════════════════════════════════════════════════
+          STAGE 6 — EVALUATE
+      ══════════════════════════════════════════════════════════════════════ */}
+      {generateResult && (
+        <div ref={evalSectionRef} className="border-t-2 border-zinc-800 mt-2">
+          <main className="max-w-6xl mx-auto px-6 py-8 space-y-6">
+
+            {/* Stage header */}
+            <div className="flex items-center gap-3">
+              <div className="w-7 h-7 rounded-md bg-emerald-600 flex items-center justify-center text-xs font-bold">6</div>
+              <h2 className="text-lg font-semibold tracking-tight">Evaluate</h2>
+              <div className="flex items-center gap-1.5 ml-1">
+                <InfoTooltip
+                  title="What the evaluation stage measures"
+                  body={"This stage scores the full pipeline end-to-end using RAGAS-style metrics.\n\nFaithfulness — are the answer's claims actually supported by the retrieved context?\nAnswer Relevancy — does the answer address the original query?\nContext Precision — were the right chunks retrieved, and were they ranked first?\nContext Recall — was everything needed to answer correctly actually retrieved? (needs ground truth)\nNoise Sensitivity — what fraction of retrieved chunks actually contributed to the answer?\n\nAll metrics are computed with cosine similarity over embeddings — the same model used in Stage 2. The embedding-based approach is fast and free. Microsoft and Anthropic use LLM-as-judge (GPT-4 / Claude) for production evaluation, which is more accurate but costs tokens. See docs/eval101.md for the full comparison."}
+                  pos="top-right"
+                />
+              </div>
+              <span className="ml-auto text-xs text-zinc-600 font-mono">RAGAS-style · embedding-based</span>
+            </div>
+
+            {/* ── Optional ground truth ── */}
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                <p className="text-xs font-medium text-zinc-500 uppercase tracking-wider">Ground Truth Answer</p>
+                <span className="text-[10px] text-zinc-600 border border-zinc-800 rounded px-1.5 py-0.5">optional</span>
+                <InfoTooltip
+                  title="Why ground truth unlocks Context Recall"
+                  body={"Without ground truth, only three metrics are computable: Faithfulness, Answer Relevancy, and Context Precision. All three can be evaluated purely from the (query, answer, retrieved chunks) triple.\n\nContext Recall requires knowing what the correct answer should contain. It checks: 'of all the things the correct answer mentions, did we retrieve the context that would allow us to say them?'\n\nA low Context Recall score means your retriever missed key information — either the top-k was too small, the relevant chunks were ranked too low, or the embedding model failed to map the query to the right region.\n\nYou don't need a perfect answer — a rough summary of what a correct answer should cover is enough."}
+                  pos="top-right"
+                />
+              </div>
+              <textarea
+                value={evalGroundTruth}
+                onChange={e => setEvalGroundTruth(e.target.value)}
+                placeholder="Optionally paste a reference answer here to unlock Context Recall scoring…"
+                rows={2}
+                className="w-full rounded-xl border border-zinc-800 bg-zinc-900 px-4 py-3 text-sm text-zinc-200 placeholder-zinc-600 resize-none focus:outline-none focus:border-zinc-600"
+              />
+            </div>
+
+            {/* ── Run button ── */}
+            <div className="flex items-center gap-3">
+              <button
+                onClick={handleEvaluate}
+                disabled={evalLoading}
+                className="px-6 py-2.5 rounded-lg text-sm font-semibold bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white transition-colors"
+              >
+                {evalLoading ? 'Evaluating…' : 'Run Evaluation'}
+              </button>
+              {evalError && <p className="text-sm text-red-400">{evalError}</p>}
+            </div>
+
+            {evalResult && !evalLoading && (
+              <div className="space-y-6">
+
+                {/* ── Metric score cards ── */}
+                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+                  {[
+                    {
+                      label: 'Faithfulness',
+                      value: evalResult.faithfulness,
+                      sub: `${evalResult.n_grounded}/${evalResult.n_sentences} sentences grounded`,
+                      tooltipTitle: 'Faithfulness — are claims supported by context?',
+                      tooltipBody: "Are the answer's claims actually entailed by the retrieved chunks?\n\nA faithful answer only says things that are supported by the documents you gave it. Score 1.0 = every sentence is grounded. Score 0.0 = nothing is grounded — the model is generating from training weights.\n\nRAGAS: extracts atomic claims, verifies each with an LLM.\nThis lab: cosine similarity per sentence vs all chunks (threshold 0.35).\nMicrosoft Azure AI: 'Groundedness' — GPT-4 rates 1–5.\nAnthropic: Claude identifies unsupported claims and returns a structured JSON verdict with reasoning.\n\nLow faithfulness = hallucination. The most important metric for enterprise RAG.",
+                      color: evalResult.faithfulness >= 0.7 ? 'emerald' : evalResult.faithfulness >= 0.4 ? 'amber' : 'red',
+                    },
+                    {
+                      label: 'Answer Relevancy',
+                      value: evalResult.answer_relevancy,
+                      sub: 'cosine(query, answer)',
+                      tooltipTitle: 'Answer Relevancy — does the answer address the query?',
+                      tooltipBody: "High faithfulness doesn't mean a useful answer. The model could faithfully quote the retrieved chunks while completely ignoring the question.\n\nRAGAS: generate N questions from the answer, average their cosine similarity to the original query. If the answer is on-topic, reverse-engineered questions should be similar to yours.\nThis lab: cosine(query_embedding, answer_embedding) — fast approximation.\nMicrosoft: 'Relevance' — GPT-4 judges on 1–5 scale.\n\nLow relevancy = the model answered a different question than you asked — often caused by retrieved chunks that were topically nearby but not the right content.",
+                      color: evalResult.answer_relevancy >= 0.7 ? 'emerald' : evalResult.answer_relevancy >= 0.4 ? 'amber' : 'red',
+                    },
+                    {
+                      label: 'Context Precision',
+                      value: evalResult.context_precision,
+                      sub: `${evalResult.n_relevant_chunks}/${evalResult.n_chunks} chunks relevant`,
+                      tooltipTitle: 'Context Precision — did we retrieve the right chunks, ranked first?',
+                      tooltipBody: "Not just 'are the relevant chunks in the result set?' but 'were they ranked first?'\n\nRAGAS weighted precision@k formula: relevant chunks ranked early contribute more to the score than relevant chunks buried at the bottom. This directly measures retrieval quality — a well-calibrated retriever should put the most relevant chunks at ranks 1, 2, 3.\n\nFormula: CP = Σk [relevant_k × precision@k] / total_relevant\n\nLow precision = your retriever is returning noise — irrelevant chunks that waste context budget, add confusion, and increase hallucination risk.\n\nFix: adjust top-k, tune the embedding model, add a reranker (which is exactly what Stage 4 does).",
+                      color: evalResult.context_precision >= 0.7 ? 'emerald' : evalResult.context_precision >= 0.4 ? 'amber' : 'red',
+                    },
+                    {
+                      label: 'Context Recall',
+                      value: evalResult.context_recall,
+                      sub: evalResult.context_recall === null ? 'needs ground truth' : `${evalResult.gt_sentence_scores.filter(s => s.supported).length}/${evalResult.gt_sentence_scores.length} GT sentences covered`,
+                      tooltipTitle: 'Context Recall — did we retrieve everything needed?',
+                      tooltipBody: "Context Precision measures chunk quality. Context Recall measures completeness.\n\nFor each sentence in the ground truth answer, check: is it supported by any retrieved chunk? Score = fraction of GT sentences that are covered.\n\nLow recall means your retriever missed key information — either top-k is too small, the relevant chunk was ranked too low, or the embedding model failed to connect the query to the right document region.\n\nThis is the metric that justifies increasing top-k. Trading lower Context Precision (more noise) for higher Context Recall (more coverage) is a deliberate retrieval decision. Reranking helps recover precision after increasing k.\n\nRequires a reference answer — paste one in the ground truth field above.",
+                      color: evalResult.context_recall === null ? 'zinc' : evalResult.context_recall >= 0.7 ? 'emerald' : evalResult.context_recall >= 0.4 ? 'amber' : 'red',
+                    },
+                    {
+                      label: 'Noise Sensitivity',
+                      value: evalResult.noise_sensitivity,
+                      sub: `${evalResult.n_contributing_chunks}/${evalResult.n_chunks} chunks used`,
+                      tooltipTitle: 'Noise Sensitivity — how much of the context was actually used?',
+                      tooltipBody: "Fraction of retrieved chunks that were cited by at least one grounded answer sentence. The rest were noise.\n\nIf you retrieved 10 chunks and only 2 contributed to the answer, 8 took up context window space, potentially confused the model, and cost tokens.\n\nTruLens calls this 'context utilisation'. High noise (low score) is often more fixable than low faithfulness:\n• Reduce top-k\n• Use a better reranker (cross-encoder rather than cosine)\n• Apply compaction to drop irrelevant sentences within chunks\n• Increase the relevance threshold for what gets included\n\nNot a standard RAGAS metric but highly diagnostic in production pipelines. Perplexity and Bing both monitor chunk utilisation as a proxy for retrieval health.",
+                      color: evalResult.noise_sensitivity >= 0.6 ? 'emerald' : evalResult.noise_sensitivity >= 0.3 ? 'amber' : 'red',
+                    },
+                  ].map(({ label, value, sub, tooltipTitle, tooltipBody, color }) => {
+                    const pct = value === null ? null : Math.round((value as number) * 100)
+                    const colorMap: Record<string, { ring: string; text: string; bar: string; bg: string }> = {
+                      emerald: { ring: 'border-emerald-500/40', text: 'text-emerald-400', bar: 'bg-emerald-500', bg: 'bg-emerald-500/10' },
+                      amber:   { ring: 'border-amber-500/40',   text: 'text-amber-400',   bar: 'bg-amber-500',   bg: 'bg-amber-500/10'   },
+                      red:     { ring: 'border-red-500/40',     text: 'text-red-400',     bar: 'bg-red-500',     bg: 'bg-red-500/10'     },
+                      zinc:    { ring: 'border-zinc-700',       text: 'text-zinc-500',    bar: 'bg-zinc-700',    bg: 'bg-zinc-800/50'    },
+                    }
+                    const c = colorMap[color]
+                    return (
+                      <div key={label} className={`rounded-xl border ${c.ring} ${c.bg} px-4 py-4 space-y-2`}>
+                        <div className="flex items-start justify-between gap-1">
+                          <p className="text-[10px] font-medium text-zinc-500 uppercase tracking-wider leading-tight">{label}</p>
+                          <InfoTooltip title={tooltipTitle} body={tooltipBody} pos="top-left" />
+                        </div>
+                        <p className={`text-2xl font-mono font-bold ${c.text}`}>
+                          {pct === null ? '—' : `${pct}%`}
+                        </p>
+                        <div className="w-full h-1 rounded-full bg-zinc-800">
+                          {pct !== null && <div className={`h-1 rounded-full ${c.bar}`} style={{ width: `${pct}%` }} />}
+                        </div>
+                        <p className="text-[10px] text-zinc-600 leading-tight">{sub}</p>
+                      </div>
+                    )
+                  })}
+                </div>
+
+                {/* ── Radar chart ── */}
+                <div className="rounded-xl bg-zinc-900 border border-zinc-800 px-5 py-5">
+                  <div className="flex items-center gap-2 mb-4">
+                    <p className="text-xs font-medium text-zinc-400 uppercase tracking-wider">Pipeline health — radar</p>
+                    <InfoTooltip
+                      title="How to read the radar chart"
+                      body={"Each axis represents one evaluation metric. The outer edge = 1.0 (perfect). The shaded polygon shows your pipeline's current scores.\n\nA healthy RAG pipeline has a large, roughly symmetric polygon. Dents in specific axes diagnose specific problems:\n\n• Dent in Faithfulness → hallucination problem — model is generating beyond the retrieved context\n• Dent in Answer Relevancy → off-topic retrieval — wrong chunks are being retrieved\n• Dent in Context Precision → retrieval ranking problem — relevant chunks buried too low\n• Dent in Context Recall → coverage problem — retriever missed key information (check top-k)\n• Dent in Noise Sensitivity → too many irrelevant chunks — reduce top-k or improve reranker"}
+                      pos="top-right"
+                    />
+                  </div>
+                  <EvalRadarChart result={evalResult} />
+                </div>
+
+                {/* ── Sentence-level faithfulness breakdown ── */}
+                <div className="rounded-xl bg-zinc-900 border border-zinc-800 px-5 py-5 space-y-3">
+                  <div className="flex items-center gap-2">
+                    <p className="text-xs font-medium text-zinc-400 uppercase tracking-wider">Faithfulness — sentence breakdown</p>
+                    <InfoTooltip
+                      title="How each answer sentence scored"
+                      body={"Each sentence in the generated answer is scored against all retrieved chunks. Max cosine similarity across all chunks determines whether the sentence is considered grounded (≥ 0.35) or ungrounded.\n\nGreen = grounded (the model is drawing from your documents)\nRed = ungrounded (the model may be generating from training weights)\n\nThis is the same calculation used by the Stage 5 grounding overlay. Here you see the raw similarity scores, not just the highlight colours.\n\nMicrosoft Azure AI: uses GPT-4 to decide whether each claim is entailed by context — more accurate than cosine for paraphrased facts.\nAnthropic: Claude returns a JSON list of unsupported claims with reasoning traces."}
+                      pos="top-right"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    {evalResult.sentence_scores.map((s, i) => (
+                      <div key={i} className={`rounded-lg border px-4 py-3 ${s.grounded ? 'border-emerald-800/40 bg-emerald-950/20' : 'border-red-800/40 bg-red-950/20'}`}>
+                        <div className="flex items-start justify-between gap-3">
+                          <p className="text-sm text-zinc-300 leading-relaxed flex-1">{s.sentence}</p>
+                          <div className="shrink-0 text-right">
+                            <p className={`text-sm font-mono font-bold ${s.grounded ? 'text-emerald-400' : 'text-red-400'}`}>
+                              {Math.round(s.max_similarity * 100)}%
+                            </p>
+                            <p className="text-[10px] text-zinc-600">sim to chunk #{s.best_chunk_idx + 1}</p>
+                          </div>
+                        </div>
+                        <p className={`text-[10px] mt-1 font-medium ${s.grounded ? 'text-emerald-600' : 'text-red-600'}`}>
+                          {s.grounded ? '✓ grounded' : '✗ ungrounded — hallucination risk'}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* ── Chunk relevance breakdown (context precision) ── */}
+                <div className="rounded-xl bg-zinc-900 border border-zinc-800 px-5 py-5 space-y-3">
+                  <div className="flex items-center gap-2">
+                    <p className="text-xs font-medium text-zinc-400 uppercase tracking-wider">Context Precision — chunk relevance by rank</p>
+                    <InfoTooltip
+                      title="How each retrieved chunk contributed to context precision"
+                      body={"For each retrieved chunk (in rank order), this shows: how similar it is to your query (cosine), whether it's considered relevant (≥ 0.30), and the running precision@k.\n\nPrecision@k = (# relevant chunks seen so far) / k\n\nThe context precision score is the weighted average of precision@k values for ranks where the chunk was relevant. This means a relevant chunk at rank 1 contributes more than an equally relevant chunk at rank 5.\n\nA good reranker should push relevant chunks to ranks 1, 2, 3 — which is exactly what the cross-encoder in Stage 4 does. If context precision is low even after reranking, the issue is in the retrieval candidates, not the reranking."}
+                      pos="top-right"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    {evalResult.chunk_relevance.map((c, i) => (
+                      <div key={i} className={`rounded-lg border px-4 py-3 ${c.relevant ? 'border-emerald-800/40 bg-emerald-950/10' : 'border-zinc-800 bg-zinc-900'}`}>
+                        <div className="flex items-start gap-3">
+                          <div className="shrink-0 w-6 h-6 rounded-md bg-zinc-800 flex items-center justify-center text-xs font-mono text-zinc-500 mt-0.5">
+                            {i + 1}
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <p className="text-xs text-zinc-400 leading-relaxed truncate">{c.preview}</p>
+                          </div>
+                          <div className="shrink-0 text-right space-y-0.5">
+                            <p className={`text-sm font-mono font-bold ${c.relevant ? 'text-emerald-400' : 'text-zinc-600'}`}>
+                              {Math.round(c.similarity * 100)}%
+                            </p>
+                            <p className="text-[10px] text-zinc-600">p@{i + 1}: {Math.round(c.precision_at_k * 100)}%</p>
+                          </div>
+                        </div>
+                        <p className={`text-[10px] mt-1 font-medium ml-9 ${c.relevant ? 'text-emerald-600' : 'text-zinc-700'}`}>
+                          {c.relevant ? '✓ relevant' : '✗ not relevant — noise'}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* ── Context Recall breakdown (only if GT provided) ── */}
+                {evalResult.gt_sentence_scores.length > 0 && (
+                  <div className="rounded-xl bg-zinc-900 border border-zinc-800 px-5 py-5 space-y-3">
+                    <div className="flex items-center gap-2">
+                      <p className="text-xs font-medium text-zinc-400 uppercase tracking-wider">Context Recall — ground truth coverage</p>
+                      <InfoTooltip
+                        title="Which ground truth sentences are covered by retrieved context?"
+                        body={"For each sentence in your reference answer, this checks whether any retrieved chunk contains supporting information.\n\nGreen = this part of the correct answer is supported by your retrieved context — the model had what it needed.\nRed = this part of the correct answer is NOT in your retrieved context — the retriever missed it.\n\nRed rows are the most actionable: they point directly to information that exists in your documents but wasn't retrieved. Fix options:\n• Increase top-k to retrieve more candidates\n• Check if the relevant chunk was split across boundaries (chunking problem)\n• Try a different embedding model that better maps this query to the right document region\n• Add HyDE — generate a hypothetical answer first, use that as the query vector"}
+                        pos="top-right"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      {evalResult.gt_sentence_scores.map((s, i) => (
+                        <div key={i} className={`rounded-lg border px-4 py-3 ${s.supported ? 'border-emerald-800/40 bg-emerald-950/20' : 'border-red-800/40 bg-red-950/20'}`}>
+                          <div className="flex items-start justify-between gap-3">
+                            <p className="text-sm text-zinc-300 leading-relaxed flex-1">{s.sentence}</p>
+                            <div className="shrink-0 text-right">
+                              <p className={`text-sm font-mono font-bold ${s.supported ? 'text-emerald-400' : 'text-red-400'}`}>
+                                {Math.round(s.max_similarity * 100)}%
+                              </p>
+                              <p className="text-[10px] text-zinc-600">best chunk #{s.best_chunk_idx + 1}</p>
+                            </div>
+                          </div>
+                          <p className={`text-[10px] mt-1 font-medium ${s.supported ? 'text-emerald-600' : 'text-red-600'}`}>
+                            {s.supported ? '✓ covered by retrieved context' : '✗ missing from retrieved context — retrieval gap'}
+                          </p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+              </div>
+            )}
+
           </main>
         </div>
       )}
@@ -2423,7 +2728,65 @@ export default function Home() {
   )
 }
 
-// ── Embed scatter plot ────────────────────────────────────────────────────────
+// ── Evaluation Radar Chart ────────────────────────────────────────────────────
+function EvalRadarChart({ result }: { result: EvalResult }) {
+  const metrics = [
+    { label: 'Faithfulness',      value: result.faithfulness,      color: '#10b981' },
+    { label: 'Ans. Relevancy',    value: result.answer_relevancy,   color: '#8b5cf6' },
+    { label: 'Ctx Precision',     value: result.context_precision,  color: '#3b82f6' },
+    { label: 'Noise Sensitivity', value: result.noise_sensitivity,  color: '#f59e0b' },
+    { label: 'Ctx Recall',        value: result.context_recall ?? 0, color: '#ec4899' },
+  ]
+  const n = metrics.length
+  const cx = 180, cy = 160, R = 110, PAD = 60
+
+  function pt(i: number, r: number) {
+    const angle = (Math.PI * 2 * i) / n - Math.PI / 2
+    return { x: cx + r * Math.cos(angle), y: cy + r * Math.sin(angle) }
+  }
+
+  const gridLevels = [0.25, 0.5, 0.75, 1.0]
+  const polyPoints = metrics.map((m, i) => pt(i, m.value * R))
+  const polyStr = polyPoints.map(p => `${p.x},${p.y}`).join(' ')
+
+  return (
+    <svg width={cx * 2 + PAD} height={cy * 2 + 20} className="mx-auto block">
+      {/* Grid rings */}
+      {gridLevels.map(lvl => {
+        const pts = metrics.map((_, i) => pt(i, lvl * R))
+        return <polygon key={lvl} points={pts.map(p => `${p.x},${p.y}`).join(' ')}
+          fill="none" stroke="#27272a" strokeWidth={1} />
+      })}
+      {/* Axis spokes */}
+      {metrics.map((_, i) => {
+        const { x, y } = pt(i, R)
+        return <line key={i} x1={cx} y1={cy} x2={x} y2={y} stroke="#3f3f46" strokeWidth={1} />
+      })}
+      {/* Score polygon */}
+      <polygon points={polyStr} fill="#10b98130" stroke="#10b981" strokeWidth={1.5} />
+      {/* Score dots */}
+      {polyPoints.map((p, i) => (
+        <circle key={i} cx={p.x} cy={p.y} r={4} fill={metrics[i].color} />
+      ))}
+      {/* Labels */}
+      {metrics.map((m, i) => {
+        const { x, y } = pt(i, R + 22)
+        const anchor = x < cx - 5 ? 'end' : x > cx + 5 ? 'start' : 'middle'
+        const isNull = i === 4 && result.context_recall === null
+        return (
+          <g key={i}>
+            <text x={x} y={y - 4} textAnchor={anchor} fontSize={10} fill={isNull ? '#52525b' : '#a1a1aa'} fontFamily="ui-monospace,monospace">
+              {m.label}
+            </text>
+            <text x={x} y={y + 9} textAnchor={anchor} fontSize={11} fill={isNull ? '#52525b' : metrics[i].color} fontFamily="ui-monospace,monospace" fontWeight="700">
+              {isNull ? '—' : `${Math.round(m.value * 100)}%`}
+            </text>
+          </g>
+        )
+      })}
+    </svg>
+  )
+}
 function EmbedScatterPlot({ coords, chunks, hovered, selected, onHover, onSelect, reduction }: {
   coords: [number, number][]; chunks: Chunk[]
   hovered: number | null; selected: number | null

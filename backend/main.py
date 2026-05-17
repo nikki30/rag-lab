@@ -1080,3 +1080,134 @@ async def generate_answer(request: GenerateRequest):
             "ratio": round(compressed_chunk_tokens / original_chunk_tokens, 3) if original_chunk_tokens > 0 else 1.0,
         },
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 6 — EVALUATION  (RAGAS-style embedding-based metrics)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class EvaluateRequest(BaseModel):
+    query: str
+    answer: str
+    chunks: list[str]           # retrieved + reranked chunk texts, rank order
+    ground_truth: str | None = None
+    embed_model: EmbedModelId = "minilm"
+
+
+@app.post("/api/evaluate")
+async def evaluate_rag(request: EvaluateRequest):
+    if not request.answer.strip():
+        raise HTTPException(status_code=400, detail="answer is required")
+    if not request.chunks:
+        raise HTTPException(status_code=400, detail="chunks are required")
+
+    model = get_model(request.embed_model)
+    answer_sentences = _split_sentences(request.answer)
+    gt_sentences = _split_sentences(request.ground_truth) if request.ground_truth else []
+
+    # Batch-encode everything in one pass for efficiency
+    all_texts = [request.query, request.answer] + request.chunks + answer_sentences + gt_sentences
+    all_embs = model.encode(all_texts, normalize_embeddings=True)
+
+    ptr = 0
+    query_emb  = all_embs[ptr]; ptr += 1
+    answer_emb = all_embs[ptr]; ptr += 1
+    chunk_embs = all_embs[ptr: ptr + len(request.chunks)]; ptr += len(request.chunks)
+    sent_embs  = all_embs[ptr: ptr + len(answer_sentences)]; ptr += len(answer_sentences)
+    gt_embs    = all_embs[ptr:]
+
+    FAITH_THRESHOLD = 0.35   # sentence considered grounded if max cosine ≥ this
+    CP_THRESHOLD    = 0.30   # chunk considered relevant to query if cosine ≥ this
+
+    # ── 1. Faithfulness ───────────────────────────────────────────────────────
+    # RAGAS: extract atomic claims from the answer, verify each is entailed by context.
+    # Our approach: cosine similarity — each answer sentence vs all retrieved chunks.
+    # LLM-as-judge (Microsoft Azure AI Eval, Anthropic): same concept, GPT-4/Claude decides
+    # entailment rather than cosine, which catches paraphrased faithfulness failures.
+    sentence_scores: list[dict] = []
+    for i, sent in enumerate(answer_sentences):
+        sims = (chunk_embs @ sent_embs[i]).tolist()
+        max_sim = float(max(sims))
+        sentence_scores.append({
+            "sentence": sent,
+            "max_similarity": round(max_sim, 4),
+            "grounded": max_sim >= FAITH_THRESHOLD,
+            "best_chunk_idx": int(np.argmax(sims)),
+        })
+    faithfulness = round(
+        sum(s["grounded"] for s in sentence_scores) / max(len(sentence_scores), 1), 4
+    )
+
+    # ── 2. Answer Relevancy ────────────────────────────────────────────────────
+    # RAGAS: generate N questions from the answer, average cosine to original query.
+    # This catches answers that are factually correct but drift off-topic.
+    # Our approach: cosine(query_embedding, answer_embedding) — faster, slightly less precise.
+    answer_relevancy = round(float(query_emb @ answer_emb), 4)
+
+    # ── 3. Context Precision ──────────────────────────────────────────────────
+    # RAGAS weighted precision@k: rewards having the most relevant chunks ranked highest.
+    # Formula: CP = Σk [relevant_k × precision@k] / total_relevant
+    # Microsoft Azure AI Eval calls this "Groundedness of retrieved context".
+    chunk_sims = (chunk_embs @ query_emb).tolist()
+    chunk_relevance: list[dict] = []
+    n_relevant_so_far = 0
+    total_relevant = sum(1 for s in chunk_sims if s >= CP_THRESHOLD)
+    for k, sim in enumerate(chunk_sims):
+        relevant = float(sim) >= CP_THRESHOLD
+        if relevant:
+            n_relevant_so_far += 1
+        chunk_relevance.append({
+            "chunk_idx": k,
+            "preview": request.chunks[k][:120] + ("…" if len(request.chunks[k]) > 120 else ""),
+            "similarity": round(float(sim), 4),
+            "relevant": relevant,
+            "precision_at_k": round(n_relevant_so_far / (k + 1), 4),
+        })
+    context_precision = round(
+        sum(cr["precision_at_k"] for cr in chunk_relevance if cr["relevant"]) / max(total_relevant, 1), 4
+    ) if total_relevant > 0 else 0.0
+
+    # ── 4. Context Recall ─────────────────────────────────────────────────────
+    # Requires ground truth. Each GT sentence checked against retrieved chunks.
+    # Answers: "did we retrieve everything needed to answer this correctly?"
+    context_recall: float | None = None
+    gt_sentence_scores: list[dict] = []
+    if len(gt_embs) > 0 and len(chunk_embs) > 0:
+        for i, gt_sent in enumerate(gt_sentences):
+            sims = (chunk_embs @ gt_embs[i]).tolist()
+            max_sim = float(max(sims))
+            gt_sentence_scores.append({
+                "sentence": gt_sent,
+                "max_similarity": round(max_sim, 4),
+                "supported": max_sim >= FAITH_THRESHOLD,
+                "best_chunk_idx": int(np.argmax(sims)),
+            })
+        context_recall = round(
+            sum(s["supported"] for s in gt_sentence_scores) / max(len(gt_sentence_scores), 1), 4
+        )
+
+    # ── 5. Noise Sensitivity ──────────────────────────────────────────────────
+    # Fraction of retrieved chunks actually cited by a grounded answer sentence.
+    # Inverse = noise ratio: chunks retrieved but contributing nothing to the answer.
+    # TruLens calls this "context utilisation"; high noise = wasted tokens + hallucination risk.
+    contributing = {
+        s["best_chunk_idx"] for s in sentence_scores
+        if s["grounded"] and s["best_chunk_idx"] >= 0
+    }
+    noise_sensitivity = round(len(contributing) / max(len(request.chunks), 1), 4)
+
+    return {
+        "faithfulness": faithfulness,
+        "answer_relevancy": answer_relevancy,
+        "context_precision": context_precision,
+        "context_recall": context_recall,
+        "noise_sensitivity": noise_sensitivity,
+        "sentence_scores": sentence_scores,
+        "chunk_relevance": chunk_relevance,
+        "gt_sentence_scores": gt_sentence_scores,
+        "n_grounded": sum(s["grounded"] for s in sentence_scores),
+        "n_sentences": len(sentence_scores),
+        "n_relevant_chunks": total_relevant,
+        "n_chunks": len(request.chunks),
+        "n_contributing_chunks": len(contributing),
+    }

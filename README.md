@@ -13,7 +13,6 @@ An interactive, local-first laboratory for exploring RAG pipeline decisions visu
 | **Reranking** | ✅ Done | Cross-encoder re-scores the top-k retrieval candidates with full query-chunk interaction. ColBERT late interaction shows token-level MaxSim heatmaps. Rank shift table compares all four strategies side-by-side. |
 | **Generation** | 🚧 In Progress | Select an LLM (Ollama local, Groq free tier, OpenAI, Anthropic), choose a compaction strategy (raw / contextual / LLMLingua), chunk ordering, and context strategy — then see the assembled prompt breakdown and grounding highlighting on the answer. |
 | **Evaluation** | 🔜 Next | Score the full pipeline end-to-end with [RAGAS](https://docs.ragas.io) metrics — Faithfulness (is the answer grounded in context?), Answer Relevancy (does the answer address the query?), Context Precision (are retrieved chunks actually relevant?), and Context Recall (did we retrieve everything needed?). Compare metric scores across different chunking strategies, retrieval configs, and models to understand which pipeline decisions actually move the needle. |
-
 ### State-of-the-art concepts woven in throughout
 
 | Concept | Stage |
@@ -32,6 +31,7 @@ An interactive, local-first laboratory for exploring RAG pipeline decisions visu
 - [`docs/indexing101.md`](docs/indexing101.md) — FAISS, HNSW, IVF, Flat explained with build vs query parameter breakdown
 - [`docs/retrieval101.md`](docs/retrieval101.md) — Dense, BM25, RRF hybrid, cross-encoder re-ranking, ColBERT late interaction
 - [`docs/generate101.md`](docs/generate101.md) — token budget problem, compaction algorithms, chunk ordering, context strategies
+- [`docs/eval101.md`](docs/eval101.md) — RAGAS metrics, LLM-as-judge, Microsoft Azure AI Eval, Anthropic model-graded evaluation, TruLens RAG Triad
 
 ## Stack
 
