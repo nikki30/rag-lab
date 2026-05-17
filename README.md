@@ -30,6 +30,7 @@ An interactive, local-first laboratory for exploring RAG pipeline decisions visu
 - [`docs/embedding101.md`](docs/embedding101.md) — vectors, cosine similarity, MRL, PCA vs UMAP vs PaCMAP, heatmap interpretation
 - [`docs/indexing101.md`](docs/indexing101.md) — FAISS, HNSW, IVF, Flat explained with build vs query parameter breakdown
 - [`docs/retrieval101.md`](docs/retrieval101.md) — Dense, BM25, RRF hybrid, cross-encoder re-ranking, ColBERT late interaction
+- [`docs/reranking101.md`](docs/reranking101.md) — Cross-encoder vs ColBERT, rank shift analysis, MonoT5/DuoT5, Cohere Rerank, Lost-in-the-Middle, Microsoft Semantic Ranking
 - [`docs/generate101.md`](docs/generate101.md) — token budget problem, compaction algorithms, chunk ordering, context strategies
 - [`docs/eval101.md`](docs/eval101.md) — RAGAS metrics, LLM-as-judge, Microsoft Azure AI Eval, Anthropic model-graded evaluation, TruLens RAG Triad
 
