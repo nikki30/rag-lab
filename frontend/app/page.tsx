@@ -95,6 +95,79 @@ interface RetrieveResponse {
   colbert: ColBERTData | null; rank_shifts: RankShift[]
 }
 
+// ── Stage 5: Generate types ───────────────────────────────────────────────────
+type LLMProvider = 'openai' | 'anthropic' | 'groq' | 'ollama'
+type CompactionAlgo = 'raw' | 'contextual' | 'llmlingua' | 'llmlingua2' | 'recomp'
+type ChunkOrderMode = 'relevance_desc' | 'relevance_asc' | 'sandwich'
+type ContextStrategy = 'stuffing' | 'map_reduce' | 'refine' | 'map_rerank'
+
+interface LLMModel {
+  id: string; label: string; provider: LLMProvider
+  contextWindow: number; inputPricePerM: number; outputPricePerM: number
+  description: string; tagline: string
+}
+
+interface PromptSection {
+  label: string; text: string; tokens: number
+  role: 'system' | 'chunk' | 'query'
+  chunk_idx: number | null; original_tokens: number | null
+}
+
+interface GroundingSentence {
+  sentence: string; max_similarity: number; grounded: boolean
+}
+
+interface GenerateResult {
+  answer: string
+  sections: PromptSection[]
+  grounding: GroundingSentence[]
+  total_input_tokens: number; total_output_tokens: number
+  cost_usd: number; model: string; context_window: number
+  compaction_stats: { original_tokens: number; compressed_tokens: number; ratio: number }
+}
+
+const LLM_MODELS: LLMModel[] = [
+  { id: 'llama3.2', label: 'Llama 3.2 (Ollama)', provider: 'ollama', contextWindow: 128000,
+    inputPricePerM: 0, outputPricePerM: 0, tagline: 'Free · local · no key needed',
+    description: 'Runs entirely on your machine via Ollama — no API key, no cost, no data leaving your computer.\n\nInstall: ollama.com → then run: ollama pull llama3.2\n\nBecause it runs locally, latency depends on your hardware. A modern laptop CPU gives usable results; a GPU makes it fast.' },
+  { id: 'llama-3.3-70b-versatile', label: 'Llama 3.3 70B (Groq)', provider: 'groq', contextWindow: 128000,
+    inputPricePerM: 0, outputPricePerM: 0, tagline: 'Free · cloud · Groq API key',
+    description: 'Meta\'s Llama 3.3 70B running on Groq\'s LPU (Language Processing Unit) hardware — purpose-built silicon for transformer inference, not a GPU.\n\nFree tier at console.groq.com. Near-instant responses (~300 tokens/sec). The best free cloud option for RAG — strong reasoning, 128k context, no billing required.' },
+]
+
+const COMPACTION_ALGOS: { id: CompactionAlgo; label: string; tagline: string; available: boolean; description: string }[] = [
+  { id: 'raw', label: 'Raw', tagline: 'No compaction', available: true,
+    description: 'No compaction — every token retrieved is sent verbatim to the LLM.\n\nThis is the baseline. Transparent but wastes context budget on irrelevant sentences and connective tissue. 100% of retrieval noise reaches the model.\n\nQuery-independent: the chunks are not inspected before sending.' },
+  { id: 'contextual', label: 'Contextual', tagline: 'Sentence-level · query-aware', available: true,
+    description: 'Each sentence in each chunk is embedded and compared to the query (cosine similarity). Sentences below threshold 0.2 are dropped — only query-relevant sentences survive.\n\nQuery-dependent: "relevant" is measured relative to what you asked. Same chunk, different query → different sentences kept.\n\nLangChain\'s ContextualCompressionRetriever uses this exact pattern. Preserves complete sentences — no partial sentence artifacts.' },
+  { id: 'llmlingua', label: 'LLMLingua', tagline: 'Microsoft 2023 · token-level · query-blind', available: false,
+    description: 'Microsoft Research (2023). Token-level compression using perplexity scoring.\n\nHow perplexity works: a small compressor LLM (e.g. LLaMA-7B) reads the chunk and at each position computes P(token | all preceding tokens) — the probability it assigned to that token given context. This is measured as negative log-likelihood: −log P(ti | t1…ti−1).\n\nHigh score = the model was surprised = this token carries information → keep.\nLow score = the model expected this = predictable filler → drop.\n\nExample: in "As we noted earlier, Q3 revenue rose 12%", the tokens "Q3", "revenue", "12%" score high (specific, surprising). "As", "we", "noted", "earlier" score low (predictable connective tissue) and get dropped.\n\nQuery-blind: perplexity measures general information density, not relevance to your query. "shareholders" gets the same score whether you asked about ownership or revenue.\n\nAchieves 3–5× compression. Requires a GPU-hosted compressor LLM.\n\n⚠ Greyed out — not yet wired up in this lab. Would require: pip install llmlingua + a hosted compressor model.' },
+  { id: 'llmlingua2', label: 'LLMLingua-2', tagline: 'Microsoft 2024 · query-conditioned · used in Copilot', available: false,
+    description: 'Microsoft Research (2024). Fixes LLMLingua\'s query-blindness by replacing perplexity scoring with a trained binary classifier.\n\nTraining: GPT-4 read (query, chunk) pairs and labelled each token keep or drop — knowing the query when deciding. This created supervision data where "shareholders" is labelled keep=true if the query is about ownership, keep=false if about revenue.\n\nA BERT-class model (~125M params) was then fine-tuned on these labels.\n\nAt inference: classifier receives [query tokens] + [chunk tokens] and outputs a keep/drop score per chunk token. The query is never compressed — it\'s the context that shifts what "important" means. The chunk tokens below threshold are dropped before the prompt is assembled.\n\nKey improvements over v1:\n• Query-conditioned — "important" is relative to what you asked\n• ~10× faster — runs on CPU in ~20ms (no GPU needed)\n• Preserves instruction tokens better\n• Used in Microsoft Copilot\'s context budget management layer\n\n⚠ Greyed out — not yet wired up in this lab. Would require: pip install llmlingua.' },
+  { id: 'recomp', label: 'RECOMP', tagline: 'Google 2023 · abstractive · most query-aware', available: false,
+    description: 'Google Research (2023). Instead of filtering tokens, a small model rewrites each chunk into a compact, query-focused summary.\n\nMost query-conditioned of all three: the rewrite is shaped entirely by the query — it doesn\'t preserve the original wording, it generates new text that answers "what from this chunk is relevant to the query?"\n\nProduces fluent, dense output rather than choppy filtered text. Slowest (one generation call per chunk) but highest quality. Best when coherent, readable context matters more than raw faithfulness to the source.' },
+]
+
+const CHUNK_ORDERS: { id: ChunkOrderMode; label: string; description: string }[] = [
+  { id: 'relevance_desc', label: 'Relevance ↓ (default)',
+    description: 'Most relevant chunk first, least relevant last. The intuitive default.\n\nThe problem: as you add more chunks, your best evidence drifts toward the middle — where LLMs pay least attention. Liu et al. (2023) showed ~20% accuracy drop for evidence at position 5 vs position 1 in a 10-chunk context. This effect gets worse as context grows.' },
+  { id: 'relevance_asc', label: 'Relevance ↑ (recency bias)',
+    description: 'Least relevant first, most relevant last. Exploits the recency effect — LLMs recall information near the end of their context most reliably, because it\'s closest to where generation starts.\n\nCounter-intuitive but empirically stronger on several benchmarks, especially with 3–5 chunks. The model finishes reading your best evidence right before it generates.' },
+  { id: 'sandwich', label: 'Sandwich (recommended)',
+    description: 'Most relevant chunk at position 1, second-most relevant at the end, the rest buried in the middle.\n\nExploits both primacy and recency bias simultaneously — your two highest-quality chunks frame the context window from both ends. Everything in the middle is filler the model is statistically likely to underweight anyway.\n\nDirectly addresses Lost-in-the-Middle (Liu et al. 2023). Used by Perplexity and Bing in production. Recommended default for production RAG.' },
+]
+
+const CONTEXT_STRATEGIES: { id: ContextStrategy; label: string; tagline: string; available: boolean; description: string; calls: string }[] = [
+  { id: 'stuffing', label: 'Stuffing', tagline: 'All chunks · one call', available: true, calls: '1 LLM call',
+    description: 'All retrieved chunks are concatenated into a single prompt and sent in one LLM call. Simple, fast, the standard approach for most production RAG.\n\nThe LLM sees everything at once — no information is lost across calls. Breaks only when the total tokens (system prompt + chunks + query + output reserve) exceed the model\'s context window.\n\nFor most use cases with ≤20 chunks this is the right choice.' },
+  { id: 'map_reduce', label: 'Map-Reduce', tagline: 'Summarise → combine', available: false, calls: 'N+1 LLM calls',
+    description: 'Map: each chunk gets its own LLM call — "given this chunk, what is relevant to the query?" Reduce: all partial answers are combined in a final LLM call to produce the full answer.\n\nN+1 LLM calls total, but the map phase is parallelisable.\n\nHandles arbitrarily large corpora — no window size limit. Amazon Bedrock, LangChain, and LlamaIndex expose this as a first-class option for long-document Q&A. Use when stuffing hits the window limit.' },
+  { id: 'refine', label: 'Refine', tagline: 'Iterative refinement', available: false, calls: 'N LLM calls',
+    description: 'Call 1: generate an initial answer from chunk 1 alone. Call 2: "here is the current answer — refine it using chunk 2." Repeat sequentially through all N chunks.\n\nN LLM calls, not parallelisable — each call depends on the previous answer.\n\nMost coherent synthesis: each step builds on the last, so the final answer integrates evidence progressively rather than trying to combine it all at once. Best when sequential order matters — e.g., reasoning through a document in order. Highest latency of all strategies.' },
+  { id: 'map_rerank', label: 'Map-Rerank', tagline: 'Answer per chunk · pick best', available: false, calls: 'N LLM calls',
+    description: 'Each chunk generates its own candidate answer with a confidence score. The highest-confidence answer wins — no synthesis step.\n\nN LLM calls, parallelisable.\n\nBest for factoid QA where you expect the answer to live entirely within one chunk ("what is the CEO\'s name?"). Wastes calls if the answer requires combining evidence across multiple chunks — the synthesis step never happens.' },
+]
+
 const EMBED_MODELS: EmbedModel[] = [
   { id: 'minilm',    label: 'MiniLM-L6',       dims: 384, speed: 'Fast',    tagline: 'Industry default',       description: 'The workhorse of local RAG. Small, fast, surprisingly good. 384 numbers per chunk. Best starting point.' },
   { id: 'bge-small', label: 'BGE-Small',        dims: 384, speed: 'Fast',    tagline: 'State-of-the-art small', description: 'BAAI\'s model beats MiniLM on retrieval benchmarks at the same size. Same speed, better recall. Current SOTA at 384d.' },
@@ -378,6 +451,92 @@ function ColBERTHeatmap({ data, topChunk }: { data: ColBERTData; topChunk: Retri
   )
 }
 
+// ── Context Window Tank ───────────────────────────────────────────────────────
+const TANK_CHUNK_COLORS = ['#8b5cf6', '#0ea5e9', '#10b981', '#f59e0b', '#f43f5e', '#ec4899', '#06b6d4', '#a3e635', '#fb923c', '#2dd4bf']
+
+function ContextWindowTank({ sections, contextWindow }: { sections: PromptSection[]; contextWindow: number }) {
+  const OUTPUT_RESERVE = 1000
+  const usedTokens = sections.reduce((s, sec) => s + sec.tokens, 0) + OUTPUT_RESERVE
+  const usedPct = Math.min(100, (usedTokens / contextWindow) * 100)
+  const overflowing = usedPct > 90
+
+  // Assign colours per-section upfront
+  let chunkIdx = 0
+  const withColors = sections.map(sec => {
+    const color = sec.role === 'system' ? '#52525b'
+      : sec.role === 'query' ? '#f97316'
+      : TANK_CHUNK_COLORS[chunkIdx++ % TANK_CHUNK_COLORS.length]
+    return { ...sec, color }
+  })
+
+  // Render order in tank: bottom = system, then chunks, then query, then output reserve at top
+  // We render from bottom by using flex-col-reverse on the tank container
+  const tankSections = [
+    ...withColors,
+    { label: 'Output reserve', tokens: OUTPUT_RESERVE, role: 'output', color: '#ef444480', chunk_idx: null, original_tokens: null, text: '' },
+  ]
+
+  return (
+    <div className="flex gap-5 items-start">
+      {/* Tank bar */}
+      <div className="flex flex-col items-center gap-1.5 shrink-0">
+        <span className="text-[10px] text-zinc-500 font-mono">{(contextWindow / 1000).toFixed(0)}k</span>
+        <div
+          className={`w-10 rounded-lg border overflow-hidden flex flex-col-reverse ${overflowing ? 'border-red-500/60' : 'border-zinc-700'}`}
+          style={{ height: 240, backgroundColor: '#18181b' }}
+        >
+          {tankSections.map((sec, i) => {
+            const heightPct = Math.min((sec.tokens / contextWindow) * 100, 100)
+            if (heightPct < 0.1) return null
+            return (
+              <div key={i} title={`${sec.label}: ${sec.tokens.toLocaleString()} tokens`}
+                className="w-full shrink-0 transition-all duration-500"
+                style={{ height: `${heightPct}%`, backgroundColor: sec.color, opacity: sec.role === 'output' ? 0.4 : 0.75 }}
+              />
+            )
+          })}
+        </div>
+        <span className={`text-[10px] font-mono font-semibold ${overflowing ? 'text-red-400' : 'text-zinc-500'}`}>
+          {Math.round(usedPct)}%
+        </span>
+      </div>
+
+      {/* Legend — reversed so top of tank = top of list */}
+      <div className="flex-1 min-w-0">
+        <div className="flex flex-col-reverse gap-1">
+          {tankSections.map((sec, i) => (
+            <div key={i} className="flex items-center gap-2 min-w-0">
+              <div className="w-2.5 h-2.5 rounded-sm shrink-0" style={{ backgroundColor: sec.color, opacity: sec.role === 'output' ? 0.5 : 0.8 }} />
+              <span className="text-xs text-zinc-400 flex-1 truncate min-w-0">{sec.label}</span>
+              <div className="flex items-center gap-1.5 shrink-0">
+                {sec.original_tokens && sec.original_tokens !== sec.tokens && (
+                  <span className="text-[10px] text-zinc-600 line-through font-mono">{sec.original_tokens.toLocaleString()}</span>
+                )}
+                <span className="text-xs font-mono text-zinc-500">{sec.tokens.toLocaleString()}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Usage bar */}
+        <div className="mt-3 space-y-1">
+          <div className="h-1.5 rounded-full bg-zinc-800 overflow-hidden">
+            <div className={`h-full rounded-full transition-all duration-500 ${overflowing ? 'bg-red-500' : usedPct > 70 ? 'bg-amber-500' : 'bg-emerald-500'}`}
+              style={{ width: `${usedPct}%` }} />
+          </div>
+          <div className="flex justify-between text-[10px] text-zinc-600">
+            <span>{usedTokens.toLocaleString()} tokens used</span>
+            <span>{(contextWindow - usedTokens).toLocaleString()} remaining</span>
+          </div>
+          {overflowing && (
+            <p className="text-[10px] text-red-400">Context nearly full — consider reducing top-k or switching to a model with a larger window</p>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ── Main page ─────────────────────────────────────────────────────────────────
 export default function Home() {
   const [text, setText] = useState(SAMPLE_TEXT)
@@ -427,6 +586,18 @@ export default function Home() {
   const [mrlDims, setMrlDims] = useState(768)
   const [traversalStep, setTraversalStep] = useState(-1)
   const indexSectionRef = useRef<HTMLDivElement>(null)
+
+  // ── Generate stage ──
+  const [genModel, setGenModel] = useState<LLMModel>(LLM_MODELS[0])
+  const [genApiKey, setGenApiKey] = useState('')
+  const [genCompaction, setGenCompaction] = useState<CompactionAlgo>('raw')
+  const [genChunkOrder, setGenChunkOrder] = useState<ChunkOrderMode>('relevance_desc')
+  const [genContextStrategy, setGenContextStrategy] = useState<ContextStrategy>('stuffing')
+  const [generateResult, setGenerateResult] = useState<GenerateResult | null>(null)
+  const [generateLoading, setGenerateLoading] = useState(false)
+  const [generateError, setGenerateError] = useState<string | null>(null)
+  const [apiKeyMissing, setApiKeyMissing] = useState(false)
+  const generateSectionRef = useRef<HTMLDivElement>(null)
 
   // ── Retrieval stage ──
   const [retrieveQuery, setRetrieveQuery] = useState('')
@@ -533,6 +704,43 @@ export default function Home() {
       setTimeout(() => retrieveSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100)
     } catch (e) { setRetrieveError(e instanceof Error ? e.message : 'Unknown error') }
     finally { setRetrieveLoading(false) }
+  }
+
+  async function handleGenerate() {
+    if (!retrieveResult?.reranked.length) return
+    // Always scroll to stage 5 first so the user sees any errors
+    generateSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    if (genModel.provider !== 'ollama' && !genApiKey.trim()) { setApiKeyMissing(true); return }
+    setApiKeyMissing(false)
+    setGenerateLoading(true); setGenerateError(null); setGenerateResult(null)
+    try {
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), 30000)
+      const res = await fetch('http://localhost:8000/api/generate', {
+        method: 'POST',
+        signal: controller.signal,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query: retrieveQuery,
+          chunks: retrieveResult.reranked,
+          model: genModel.id,
+          api_key: genApiKey,
+          compaction: genCompaction,
+          chunk_order: genChunkOrder,
+          context_strategy: genContextStrategy,
+          temperature: 0.1,
+        }),
+      })
+      clearTimeout(timeout)
+      if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b?.detail ?? `Error ${res.status}`) }
+      const data: GenerateResult = await res.json()
+      setGenerateResult(data)
+      setTimeout(() => generateSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100)
+    } catch (e) {
+      const msg = e instanceof Error ? (e.name === 'AbortError' ? 'Request timed out after 30s — the LLM call took too long' : e.message) : 'Unknown error'
+      setGenerateError(msg)
+    }
+    finally { setGenerateLoading(false) }
   }
 
   async function handleCompare() {
@@ -1858,6 +2066,352 @@ export default function Home() {
 
                   </div>
                 )}
+              </div>
+            )}
+
+            {/* ── Generate CTA — appears once retrieval result exists ── */}
+            {retrieveResult && (
+              <div className="flex items-center gap-4 rounded-xl border border-zinc-800 bg-zinc-900/60 px-5 py-4">
+                <div className="flex-1">
+                  <p className="text-sm font-semibold text-zinc-200">Ready to generate</p>
+                  <p className="text-xs text-zinc-500 mt-0.5">
+                    {retrieveResult.reranked.length} re-ranked chunks ready — send them to an LLM and see the answer grounded in your retrieved context.
+                  </p>
+                </div>
+                <button
+                  onClick={handleGenerate}
+                  disabled={generateLoading}
+                  className="px-5 py-2 rounded-lg text-sm font-semibold transition-colors bg-violet-600 hover:bg-violet-500 disabled:opacity-40 text-white whitespace-nowrap"
+                >
+                  {generateLoading ? 'Generating…' : 'Generate Answer →'}
+                </button>
+              </div>
+            )}
+
+          </main>
+        </div>
+      )}
+
+      {/* ══════════════════════════════════════════════════════════════════════
+          STAGE 5 — GENERATE
+      ══════════════════════════════════════════════════════════════════════ */}
+      {retrieveResult && (
+        <div ref={generateSectionRef} className="border-t-2 border-zinc-800 mt-2">
+          <main className="max-w-6xl mx-auto px-6 py-8 space-y-6">
+
+            {/* Stage header */}
+            <div className="flex items-center gap-3">
+              <div className="w-7 h-7 rounded-md bg-violet-600 flex items-center justify-center text-xs font-bold">5</div>
+              <h2 className="text-lg font-semibold tracking-tight">Generate</h2>
+              <div className="flex items-center gap-1.5 ml-1">
+                <InfoTooltip
+                  title="What happens in the generate stage?"
+                  body={"The retrieved and re-ranked chunks get assembled into a prompt and sent to a large language model.\n\nThis is the G in RAG. Everything before this was retrieval — finding the right context. Generation is where that context is used to produce an answer.\n\nThe key variables:\n• Which model you use (context window, cost, reasoning quality)\n• How you compact the chunks before sending (raw vs compressed)\n• The order you place chunks in the prompt (Lost-in-the-Middle effect)\n\nAfter the answer comes back, each sentence is scored for grounding — how well it's supported by the retrieved context vs. generated from the model's training weights."}
+                  pos="top-right"
+                />
+              </div>
+              <span className="ml-auto text-xs text-zinc-600 font-mono">{retrieveResult.reranked.length} chunks from stage 4</span>
+            </div>
+
+            {/* ── Model picker ── */}
+            <div className="space-y-3">
+              <div className="flex items-center gap-2">
+                <p className="text-xs font-medium text-zinc-500 uppercase tracking-wider">LLM Model</p>
+                <InfoTooltip
+                  title="How the model choice affects RAG"
+                  body={"The model determines three things:\n\n1. Context window — how many tokens you can send. Gemini and Claude offer 200k; OpenAI caps at 128k. This directly limits how many chunks (and how long) you can include.\n\n2. Cost — billed per token in and out. A RAG prompt with 5 chunks easily hits 1000 input tokens. At scale, model choice dominates your bill.\n\n3. Reasoning quality — some models better at faithfully synthesising across multiple chunks, or at flagging when the context is insufficient.\n\nFor most RAG workloads: start with GPT-4o-mini or Haiku (cheap, fast). Upgrade to GPT-4o or Sonnet only if answer quality suffers."}
+                  pos="top-right"
+                />
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                {LLM_MODELS.map(m => (
+                  <button key={m.id} onClick={() => setGenModel(m)}
+                    className={`rounded-xl border px-3 py-3 text-left transition-all ${genModel.id === m.id ? 'border-violet-500 bg-violet-500/10 text-zinc-100' : 'border-zinc-800 bg-zinc-900 text-zinc-400 hover:border-zinc-600'}`}>
+                    <div className="flex items-start justify-between mb-1">
+                      <p className="text-sm font-semibold leading-tight">{m.label}</p>
+                      <InfoTooltip title={m.label} body={m.description} pos="top-left" />
+                    </div>
+                    <p className="text-xs text-zinc-500 mb-1.5">{m.tagline}</p>
+                    <div className="flex gap-2 text-xs">
+                      <span className="text-zinc-600">{(m.contextWindow / 1000).toFixed(0)}k ctx</span>
+                      <span className="text-zinc-600">${m.inputPricePerM}/M in</span>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* ── API Key ── */}
+            <div className="space-y-2">
+              {genModel.provider === 'ollama' ? (
+                <div className="flex items-center gap-3 rounded-xl border border-emerald-800/40 bg-emerald-950/20 px-4 py-3">
+                  <span className="text-emerald-400 text-sm">✓</span>
+                  <div>
+                    <p className="text-sm text-emerald-300 font-medium">No API key needed</p>
+                    <p className="text-xs text-zinc-500 mt-0.5">Ollama runs locally — make sure it's running and the model is pulled (<span className="font-mono">ollama pull {genModel.id}</span>)</p>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div className="flex items-center gap-2">
+                    <p className="text-xs font-medium text-zinc-500 uppercase tracking-wider">
+                      {genModel.provider === 'openai' ? 'OpenAI' : genModel.provider === 'groq' ? 'Groq' : 'Anthropic'} API Key
+                    </p>
+                    <InfoTooltip
+                      title="API key"
+                      body={`Your key is used for exactly one API call and never stored or logged.\n\n${genModel.provider === 'openai' ? 'Get an OpenAI key at platform.openai.com → API keys.' : genModel.provider === 'groq' ? 'Get a free Groq key at console.groq.com → API Keys. Groq has a generous free tier with no billing required.' : 'Get an Anthropic key at console.anthropic.com → API keys.'}`}
+                    />
+                  </div>
+                  <input
+                    type="password"
+                    value={genApiKey}
+                    onChange={e => { setGenApiKey(e.target.value); if (e.target.value.trim()) setApiKeyMissing(false) }}
+                    placeholder={genModel.provider === 'groq' ? 'gsk_... (Groq API key — free at console.groq.com)' : `sk-... (${genModel.provider === 'openai' ? 'OpenAI' : 'Anthropic'} API key)`}
+                    className={`w-full max-w-md rounded-xl bg-zinc-900 border px-4 py-2.5 text-sm text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-2 ${apiKeyMissing ? 'border-red-500 ring-2 ring-red-500/40 focus:ring-red-500' : 'border-zinc-700 focus:ring-violet-600'}`}
+                  />
+                  {apiKeyMissing && <p className="text-xs text-red-400 mt-1">API key is required to generate an answer</p>}
+                </>
+              )}
+            </div>
+
+            {/* ── Compaction ── */}
+            <div className="space-y-3">
+              <div className="flex items-center gap-2">
+                <p className="text-xs font-medium text-zinc-500 uppercase tracking-wider">Compaction</p>
+                <InfoTooltip
+                  title="Why compact before sending?"
+                  body={"Retrieved chunks are noisy — a 500-token chunk might contain 400 tokens of setup, transitions, and padding around the 100 tokens you actually need.\n\nCompaction removes the irrelevant parts before sending to the LLM. The context window tank updates to show the before/after size.\n\nQuery-independence spectrum:\n• Raw — no inspection, fully query-blind\n• LLMLingua (2023) — drops low-perplexity tokens, still query-blind\n• Contextual — sentence-level cosine similarity to the query, query-aware\n• LLMLingua-2 (2024) — token-level classifier conditioned on the query, used in Microsoft Copilot\n• RECOMP — rewrites each chunk as a query-focused summary, most query-aware\n\nQuery-aware compaction generally produces better answers but costs more compute."}
+                  pos="top-right"
+                />
+              </div>
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+                {COMPACTION_ALGOS.map(algo => (
+                  <button key={algo.id}
+                    onClick={() => algo.available && setGenCompaction(algo.id)}
+                    disabled={!algo.available}
+                    className={`rounded-xl border px-3 py-3 text-left transition-all relative ${
+                      !algo.available ? 'opacity-40 cursor-not-allowed border-zinc-800 bg-zinc-900' :
+                      genCompaction === algo.id ? 'border-violet-500 bg-violet-500/10 text-zinc-100' :
+                      'border-zinc-800 bg-zinc-900 text-zinc-400 hover:border-zinc-600'
+                    }`}>
+                    <div className="flex items-start justify-between mb-1">
+                      <p className="text-sm font-semibold leading-tight">{algo.label}</p>
+                      <InfoTooltip title={algo.label} body={algo.description} pos="top-left" />
+                    </div>
+                    <p className="text-xs text-zinc-500">{algo.tagline}</p>
+                    {!algo.available && (
+                      <span className="absolute top-1.5 right-1.5 text-[9px] text-zinc-600 bg-zinc-800 rounded px-1 py-0.5">soon</span>
+                    )}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* ── Chunk ordering ── */}
+            <div className="space-y-3">
+              <div className="flex items-center gap-2">
+                <p className="text-xs font-medium text-zinc-500 uppercase tracking-wider">Chunk Ordering</p>
+                <InfoTooltip
+                  title="Lost-in-the-Middle (Liu et al. 2023)"
+                  body={"LLMs have a primacy and recency bias — they recall information near the start and end of their context window most reliably. Content in the middle is statistically underweighted.\n\nThis is a direct RAG problem: if your most relevant chunk sits at position 5 of 10, the model produces a lower-quality answer than if the same chunk was at position 1 or 10.\n\nOrdering strategies let you exploit these biases rather than fight them:\n• Relevance ↓ — naive but common\n• Relevance ↑ — exploits recency, counter-intuitive but works\n• Sandwich — exploits both ends simultaneously, recommended for production\n\nSandwich ordering is used by Perplexity and Bing. The paper showed ~20% accuracy drop for evidence buried in the middle of long contexts."}
+                  pos="top-right"
+                />
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                {CHUNK_ORDERS.map(ord => (
+                  <button key={ord.id} onClick={() => setGenChunkOrder(ord.id)}
+                    className={`rounded-xl border px-3 py-3 text-left transition-all ${genChunkOrder === ord.id ? 'border-violet-500 bg-violet-500/10 text-zinc-100' : 'border-zinc-800 bg-zinc-900 text-zinc-400 hover:border-zinc-600'}`}>
+                    <div className="flex items-start justify-between mb-1">
+                      <p className="text-sm font-semibold leading-tight">{ord.label}</p>
+                      <InfoTooltip title={ord.label} body={ord.description} pos="top-left" />
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* ── Context strategy ── */}
+            <div className="space-y-3">
+              <div className="flex items-center gap-2">
+                <p className="text-xs font-medium text-zinc-500 uppercase tracking-wider">Context Strategy</p>
+                <InfoTooltip
+                  title="How chunks are assembled and sent to the LLM"
+                  body={"Stuffing is the default — send everything in one call. It works until your context window fills up.\n\nThe other strategies handle the overflow problem differently:\n\n• Map-Reduce: summarise each chunk independently, then combine — N+1 calls total\n• Refine: build the answer iteratively, one chunk at a time — N calls\n• Map-Rerank: generate a candidate answer per chunk, score each, pick the best — N calls\n\nEach strategy trades latency and cost (more LLM calls) for the ability to handle more context than any single window allows. At production scale, LangChain and LlamaIndex both expose these as first-class options."}
+                  pos="top-right"
+                />
+              </div>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                {CONTEXT_STRATEGIES.map(strat => (
+                  <button key={strat.id}
+                    onClick={() => strat.available && setGenContextStrategy(strat.id)}
+                    disabled={!strat.available}
+                    className={`rounded-xl border px-3 py-3 text-left transition-all relative ${
+                      !strat.available ? 'opacity-40 cursor-not-allowed border-zinc-800 bg-zinc-900' :
+                      genContextStrategy === strat.id ? 'border-violet-500 bg-violet-500/10 text-zinc-100' :
+                      'border-zinc-800 bg-zinc-900 text-zinc-400 hover:border-zinc-600'
+                    }`}>
+                    <div className="flex items-start justify-between mb-1">
+                      <p className="text-sm font-semibold leading-tight">{strat.label}</p>
+                      <InfoTooltip title={strat.label} body={strat.description} pos="top-left" />
+                    </div>
+                    <p className="text-xs text-zinc-500 mb-1">{strat.tagline}</p>
+                    <span className={`text-[10px] font-mono ${strat.available ? 'text-violet-400/70' : 'text-zinc-600'}`}>{strat.calls}</span>
+                    {!strat.available && (
+                      <span className="absolute top-1.5 right-1.5 text-[9px] text-zinc-600 bg-zinc-800 rounded px-1 py-0.5">soon</span>
+                    )}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* ── Context window preview ── */}
+            <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-5 space-y-4">
+              <div className="flex items-center gap-2">
+                <p className="text-xs font-medium text-zinc-400 uppercase tracking-wider">Context Window</p>
+                <InfoTooltip
+                  title="The context window tax"
+                  body={"Every token in this prompt costs money and occupies space. The tank shows what's actually being sent to the model.\n\nSystem prompt: your instructions to the model (fixed overhead).\nChunks: the retrieved context (the RAG payload).\nQuery: the user's question.\nOutput reserve: tokens the model needs to generate the answer — this headroom must exist or the answer gets cut off.\n\nWatch the tank fill and shrink as you change compaction algorithms. Switching from Raw to Contextual should visibly shrink the chunk sections."}
+                  pos="top-right"
+                />
+                <span className="ml-auto text-xs text-zinc-600 font-mono">{genModel.label} · {(genModel.contextWindow / 1000).toFixed(0)}k token budget</span>
+              </div>
+
+              {/* Live preview using estimated token counts */}
+              {(() => {
+                const previewSections: PromptSection[] = [
+                  { label: 'System prompt', text: '', tokens: 42, role: 'system', chunk_idx: null, original_tokens: null },
+                  ...retrieveResult.reranked.map((r, i) => ({
+                    label: `Chunk #${r.idx + 1}`,
+                    text: r.text,
+                    tokens: Math.max(1, Math.round(r.text.length / 4)),
+                    role: 'chunk' as const,
+                    chunk_idx: r.idx,
+                    original_tokens: null,
+                  })),
+                  { label: 'User query', text: retrieveQuery, tokens: Math.max(1, Math.round(retrieveQuery.length / 4)), role: 'query', chunk_idx: null, original_tokens: null },
+                ]
+                const displaySections = generateResult ? generateResult.sections : previewSections
+                return <ContextWindowTank sections={displaySections} contextWindow={genModel.contextWindow} />
+              })()}
+
+              {generateResult && genCompaction !== 'raw' && (
+                <div className="flex items-center gap-3 rounded-lg bg-zinc-800/50 px-3 py-2 text-xs">
+                  <span className="text-zinc-400">Compaction ({genCompaction}):</span>
+                  <span className="font-mono text-zinc-500 line-through">{generateResult.compaction_stats.original_tokens.toLocaleString()} tokens</span>
+                  <span className="text-zinc-600">→</span>
+                  <span className="font-mono text-emerald-400">{generateResult.compaction_stats.compressed_tokens.toLocaleString()} tokens</span>
+                  <span className="text-zinc-500">({Math.round((1 - generateResult.compaction_stats.ratio) * 100)}% reduction)</span>
+                </div>
+              )}
+            </div>
+
+            {generateLoading && (
+              <div className="rounded-xl bg-zinc-900 border border-zinc-800 px-5 py-8 text-center text-sm text-zinc-500">
+                Calling {genModel.label}…
+              </div>
+            )}
+
+            {generateError && !generateLoading && (
+              <div className="rounded-xl border border-red-800 bg-red-950/40 px-4 py-3 text-sm text-red-400">
+                {generateError}
+              </div>
+            )}
+
+            {/* ── Answer + grounding ── */}
+            {generateResult && !generateLoading && (
+              <div className="space-y-4">
+
+                {/* Answer with grounding overlay */}
+                <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-5 space-y-4">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <p className="text-xs font-medium text-zinc-400 uppercase tracking-wider">Answer</p>
+                      <InfoTooltip
+                        title="Hallucination grounding overlay"
+                        body={"Each sentence in the answer is scored against the retrieved chunks using cosine similarity.\n\nGreen highlight = sentence is well-supported by the context (similarity ≥ 0.35). The model is drawing from your retrieved documents.\n\nYellow highlight = sentence is borderline — partial grounding. May mix context with model knowledge.\n\nNo highlight = sentence similarity is low — the model may be generating from its training weights rather than your documents. This is where hallucination risk is highest.\n\nThis is the trust signal enterprise RAG systems (Glean, Cohere, Vectara) show before returning answers to users. Most RAG demos skip it."}
+                        pos="top-right"
+                      />
+                    </div>
+                    <div className="flex items-center gap-3 text-xs">
+                      <span className="flex items-center gap-1.5">
+                        <span className="w-3 h-2.5 rounded-sm bg-emerald-500/40 border border-emerald-500/30 inline-block" />
+                        grounded
+                        <InfoTooltip title="Grounded" body={"Cosine similarity ≥ 0.35 between this sentence and the closest retrieved chunk.\n\nThe model is drawing from your documents — this sentence can be traced back to retrieved context.\n\nNote: grounded ≠ factually correct. If your chunks contained wrong information, a grounded sentence faithfully repeats it. Grounding tells you the source, not the truth."} pos="top-right" />
+                      </span>
+                      <span className="flex items-center gap-1.5">
+                        <span className="w-3 h-2.5 rounded-sm bg-amber-500/30 border border-amber-500/20 inline-block" />
+                        borderline
+                        <InfoTooltip title="Borderline" body={"Cosine similarity between 0.2 and 0.35.\n\nWeak overlap with retrieved context. The model may be paraphrasing loosely, mixing context with prior training knowledge, or the relevant chunk used different vocabulary.\n\nTreat with mild scepticism — partially supported but not strongly traceable to a specific chunk."} pos="top-right" />
+                      </span>
+                      <span className="flex items-center gap-1.5">
+                        <span className="w-3 h-2.5 rounded-sm bg-zinc-700/50 border border-zinc-700 inline-block" />
+                        ungrounded
+                        <InfoTooltip title="Ungrounded" body={"Cosine similarity below 0.2 — little to no overlap with any retrieved chunk.\n\nThe model is likely generating from its training weights rather than your documents. This is where hallucination risk is highest.\n\nNot always wrong: transitional phrases like 'Based on the information provided' score low because they\'re not semantically tied to any chunk. Context matters — ungrounded sentences in the middle of otherwise grounded answers are more suspicious than standalone connective phrases."} pos="top-right" />
+                      </span>
+                      <button onClick={handleGenerate} disabled={generateLoading}
+                        className="ml-2 px-2.5 py-1 rounded-lg bg-zinc-800 hover:bg-zinc-700 disabled:opacity-40 text-zinc-400 hover:text-zinc-200 transition-colors text-xs">
+                        ↺ Re-run
+                      </button>
+                    </div>
+                  </div>
+
+                  <p className="text-sm text-zinc-200 leading-relaxed">
+                    {generateResult.grounding.map((g, i) => {
+                      const bg = g.grounded ? 'bg-emerald-500/25 border-b border-emerald-500/40'
+                        : g.max_similarity >= 0.2 ? 'bg-amber-500/20 border-b border-amber-500/30'
+                        : ''
+                      return (
+                        <span key={i} title={`similarity: ${g.max_similarity.toFixed(3)}`}
+                          className={`rounded-sm px-0.5 ${bg} transition-colors`}>
+                          {g.sentence}{i < generateResult.grounding.length - 1 ? ' ' : ''}
+                        </span>
+                      )
+                    })}
+                  </p>
+
+                  {/* Grounding summary */}
+                  {(() => {
+                    const total = generateResult.grounding.length
+                    const grounded = generateResult.grounding.filter(g => g.grounded).length
+                    const pct = total > 0 ? Math.round((grounded / total) * 100) : 0
+                    return (
+                      <div className="flex items-center gap-3 pt-2 border-t border-zinc-800">
+                        <div className="flex-1 h-1.5 rounded-full bg-zinc-800 overflow-hidden">
+                          <div className="h-full rounded-full bg-emerald-500/70 transition-all" style={{ width: `${pct}%` }} />
+                        </div>
+                        <span className={`text-xs font-mono font-semibold ${pct >= 75 ? 'text-emerald-400' : pct >= 50 ? 'text-amber-400' : 'text-rose-400'}`}>
+                          {pct}% grounded
+                        </span>
+                        <span className="text-xs text-zinc-600">({grounded}/{total} sentences)</span>
+                      </div>
+                    )
+                  })()}
+                </div>
+
+                {/* Cost + token breakdown */}
+                <div className="rounded-xl bg-zinc-900 border border-zinc-800 px-5 py-4">
+                  <div className="flex items-center gap-2 mb-3">
+                    <p className="text-xs font-medium text-zinc-400 uppercase tracking-wider">Usage</p>
+                    <InfoTooltip
+                      title="Token cost breakdown"
+                      body={"RAG is token-expensive. A typical retrieval prompt with 5 chunks easily sends 800–2000 input tokens per query.\n\nAt scale:\n• 1000 queries/day × 1000 tokens × $0.15/1M = $0.15/day on GPT-4o-mini\n• Same on GPT-4o = $2.50/day\n\nCompaction is the lever that reduces input token cost. The context window tank shows you exactly what you're paying for."}
+                    />
+                  </div>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    {[
+                      { label: 'Input tokens', value: generateResult.total_input_tokens.toLocaleString(), color: 'text-sky-400' },
+                      { label: 'Output tokens', value: generateResult.total_output_tokens.toLocaleString(), color: 'text-violet-400' },
+                      { label: 'Total tokens', value: (generateResult.total_input_tokens + generateResult.total_output_tokens).toLocaleString(), color: 'text-zinc-300' },
+                      { label: 'Est. cost', value: generateResult.cost_usd < 0.0001 ? '<$0.0001' : `$${generateResult.cost_usd.toFixed(4)}`, color: 'text-emerald-400' },
+                    ].map(({ label, value, color }) => (
+                      <div key={label} className="rounded-lg bg-zinc-800/50 px-3 py-2.5">
+                        <p className="text-[10px] text-zinc-500 uppercase tracking-wide mb-1">{label}</p>
+                        <p className={`text-lg font-mono font-bold ${color}`}>{value}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
               </div>
             )}
 

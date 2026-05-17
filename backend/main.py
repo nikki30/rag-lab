@@ -813,3 +813,270 @@ async def retrieve(request: RetrieveRequest):
         "colbert": colbert_data,
         "rank_shifts": rank_shifts,
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 5 — GENERATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+MODEL_CONTEXT_WINDOWS: dict[str, int] = {
+    "gpt-4o-mini": 128_000,
+    "gpt-4o": 128_000,
+    "claude-haiku-4-5-20251001": 200_000,
+    "claude-sonnet-4-6": 200_000,
+    "llama-3.3-70b-versatile": 128_000,
+    "llama-3.1-8b-instant": 128_000,
+    "gemma2-9b-it": 8_192,
+    "mixtral-8x7b-32768": 32_768,
+    # Ollama local models
+    "llama3.2": 128_000,
+    "gemma3": 128_000,
+    "mistral": 32_000,
+    "phi4": 16_000,
+}
+
+MODEL_PRICING: dict[str, tuple[float, float]] = {
+    # (input_per_million_tokens, output_per_million_tokens)
+    "gpt-4o-mini": (0.15, 0.60),
+    "gpt-4o": (2.50, 10.00),
+    "claude-haiku-4-5-20251001": (0.80, 4.00),
+    "claude-sonnet-4-6": (3.00, 15.00),
+    "llama-3.3-70b-versatile": (0.0, 0.0),
+    "llama-3.1-8b-instant": (0.0, 0.0),
+    "gemma2-9b-it": (0.0, 0.0),
+    "mixtral-8x7b-32768": (0.0, 0.0),
+}
+
+SYSTEM_PROMPT = (
+    "You are a helpful assistant. Answer the user's question using only the provided context. "
+    "Be concise and accurate. If the context doesn't contain enough information to fully answer, say so explicitly."
+)
+
+
+class GenerateChunk(BaseModel):
+    idx: int
+    score: float
+    text: str
+
+
+class GenerateRequest(BaseModel):
+    query: str
+    chunks: list[GenerateChunk]
+    model: str
+    api_key: str
+    compaction: str = "raw"              # "raw" | "contextual"
+    chunk_order: str = "relevance_desc"  # "relevance_desc" | "relevance_asc" | "sandwich"
+    context_strategy: str = "stuffing"  # "stuffing" | "map_reduce" | "refine" | "map_rerank"
+    temperature: float = 0.1
+
+
+def _split_sentences(text: str) -> list[str]:
+    parts = re.split(r'(?<=[.!?])\s+', text.strip())
+    return [p for p in parts if p.strip()]
+
+
+def _count_tokens(text: str, model: str) -> int:
+    if model.startswith("gpt"):
+        try:
+            import tiktoken
+            enc = tiktoken.encoding_for_model(model)
+            return len(enc.encode(text))
+        except Exception:
+            pass
+    return max(1, len(text) // 4)
+
+
+def _apply_compaction(
+    chunks: list[GenerateChunk], query: str, algo: str, embed_model
+) -> list[tuple[GenerateChunk, str]]:
+    if algo == "raw":
+        return [(c, c.text) for c in chunks]
+
+    if algo == "contextual":
+        query_emb = embed_model.encode([query], normalize_embeddings=True)[0]
+        result = []
+        for chunk in chunks:
+            sentences = _split_sentences(chunk.text)
+            if len(sentences) <= 1:
+                result.append((chunk, chunk.text))
+                continue
+            sent_embs = embed_model.encode(sentences, normalize_embeddings=True)
+            sims = (sent_embs @ query_emb).tolist()
+            kept = [s for s, sim in zip(sentences, sims) if sim > 0.2]
+            if not kept:
+                kept = [max(zip(sentences, sims), key=lambda x: x[1])[0]]
+            result.append((chunk, " ".join(kept)))
+        return result
+
+    return [(c, c.text) for c in chunks]
+
+
+def _apply_chunk_order(
+    pairs: list[tuple[GenerateChunk, str]], order: str
+) -> list[tuple[GenerateChunk, str]]:
+    if order == "relevance_asc":
+        return list(reversed(pairs))
+    if order == "sandwich" and len(pairs) > 2:
+        return [pairs[0]] + pairs[2:] + [pairs[1]]
+    return pairs  # relevance_desc — already sorted best-first
+
+
+def _score_grounding(
+    answer: str, chunk_texts: list[str], embed_model
+) -> list[dict]:
+    sentences = _split_sentences(answer)
+    if not sentences or not chunk_texts:
+        return [{"sentence": s, "max_similarity": 0.0, "grounded": False} for s in sentences]
+    try:
+        all_embs = embed_model.encode(sentences + chunk_texts, normalize_embeddings=True)
+        sent_embs = all_embs[:len(sentences)]
+        chunk_embs = all_embs[len(sentences):]
+        results = []
+        for i, sent in enumerate(sentences):
+            sims = (chunk_embs @ sent_embs[i]).tolist()
+            max_sim = float(max(sims))
+            results.append({
+                "sentence": sent,
+                "max_similarity": round(max_sim, 4),
+                "grounded": max_sim >= 0.35,
+            })
+        return results
+    except Exception:
+        return [{"sentence": s, "max_similarity": 0.0, "grounded": False} for s in sentences]
+
+
+@app.post("/api/generate")
+async def generate_answer(request: GenerateRequest):
+    if not request.chunks:
+        raise HTTPException(status_code=400, detail="No chunks provided")
+    OLLAMA_MODELS = {"llama3.2", "gemma3", "mistral", "phi4"}
+    if not request.api_key.strip() and request.model not in OLLAMA_MODELS:
+        raise HTTPException(status_code=400, detail="API key required")
+    if request.model not in MODEL_CONTEXT_WINDOWS:
+        raise HTTPException(status_code=400, detail=f"Unknown model: {request.model}")
+
+    embed_model = get_semantic_model()
+    context_window = MODEL_CONTEXT_WINDOWS[request.model]
+
+    # ── 1. Compact ────────────────────────────────────────────────────────────
+    pairs = _apply_compaction(request.chunks, request.query, request.compaction, embed_model)
+    original_chunk_tokens = sum(_count_tokens(c.text, request.model) for c, _ in pairs)
+
+    # ── 2. Order ──────────────────────────────────────────────────────────────
+    pairs = _apply_chunk_order(pairs, request.chunk_order)
+    compressed_chunk_tokens = sum(_count_tokens(t, request.model) for _, t in pairs)
+
+    # ── 3. Build prompt sections (for the context window visualisation) ───────
+    sys_tokens = _count_tokens(SYSTEM_PROMPT, request.model)
+    query_tokens = _count_tokens(request.query, request.model)
+
+    sections = [{"label": "System prompt", "text": SYSTEM_PROMPT, "tokens": sys_tokens,
+                 "role": "system", "chunk_idx": None, "original_tokens": None}]
+
+    for chunk, compacted_text in pairs:
+        orig_tok = _count_tokens(chunk.text, request.model)
+        comp_tok = _count_tokens(compacted_text, request.model)
+        sections.append({
+            "label": f"Chunk #{chunk.idx + 1}",
+            "text": compacted_text,
+            "tokens": comp_tok,
+            "role": "chunk",
+            "chunk_idx": chunk.idx,
+            "original_tokens": orig_tok if request.compaction != "raw" else None,
+        })
+
+    sections.append({"label": "User query", "text": request.query, "tokens": query_tokens,
+                     "role": "query", "chunk_idx": None, "original_tokens": None})
+
+    # ── 4. Call LLM ───────────────────────────────────────────────────────────
+    context_str = "\n\n".join(
+        f"[Context {i + 1}]:\n{text}" for i, (_, text) in enumerate(pairs)
+    )
+    user_message = f"{context_str}\n\nQuestion: {request.query}"
+
+    answer = ""
+    actual_input_tokens = sum(s["tokens"] for s in sections)
+    actual_output_tokens = 0
+
+    GROQ_MODELS = {"llama-3.3-70b-versatile", "llama-3.1-8b-instant", "gemma2-9b-it", "mixtral-8x7b-32768"}
+
+    def _openai_call(base_url: str | None, api_key: str) -> tuple[str, int, int]:
+        from openai import OpenAI
+        kwargs = {"api_key": api_key or "ollama"}
+        if base_url:
+            kwargs["base_url"] = base_url
+        client = OpenAI(**kwargs)
+        resp = client.chat.completions.create(
+            model=request.model,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
+            temperature=request.temperature,
+            max_tokens=1000,
+        )
+        return (
+            resp.choices[0].message.content or "",
+            resp.usage.prompt_tokens,
+            resp.usage.completion_tokens,
+        )
+
+    try:
+        if request.model.startswith("gpt"):
+            answer, actual_input_tokens, actual_output_tokens = _openai_call(None, request.api_key)
+
+        elif request.model.startswith("claude"):
+            from anthropic import Anthropic
+            client = Anthropic(api_key=request.api_key)
+            resp = client.messages.create(
+                model=request.model,
+                max_tokens=1000,
+                temperature=request.temperature,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_message}],
+            )
+            answer = resp.content[0].text
+            actual_input_tokens = resp.usage.input_tokens
+            actual_output_tokens = resp.usage.output_tokens
+
+        elif request.model in GROQ_MODELS:
+            answer, actual_input_tokens, actual_output_tokens = _openai_call(
+                "https://api.groq.com/openai/v1", request.api_key
+            )
+
+        else:
+            # Ollama — local OpenAI-compatible server, no real API key needed
+            answer, actual_input_tokens, actual_output_tokens = _openai_call(
+                "http://localhost:11434/v1", "ollama"
+            )
+
+    except Exception as e:
+        err = str(e)
+        if "11434" in err or "connection" in err.lower() and request.model in OLLAMA_MODELS:
+            raise HTTPException(status_code=503, detail="Ollama is not running. Start it with: ollama serve — then pull the model with: ollama pull " + request.model)
+        status = 401 if any(k in err.lower() for k in ("api key", "authentication", "invalid", "unauthorized")) else 500
+        raise HTTPException(status_code=status, detail=f"LLM error: {err}")
+
+    # ── 5. Score grounding ────────────────────────────────────────────────────
+    chunk_texts = [t for _, t in pairs]
+    grounding = _score_grounding(answer, chunk_texts, embed_model)
+
+    # ── 6. Cost ───────────────────────────────────────────────────────────────
+    in_price, out_price = MODEL_PRICING.get(request.model, (0.0, 0.0))
+    cost_usd = (actual_input_tokens / 1_000_000) * in_price + (actual_output_tokens / 1_000_000) * out_price
+
+    return {
+        "answer": answer,
+        "sections": sections,
+        "grounding": grounding,
+        "total_input_tokens": actual_input_tokens,
+        "total_output_tokens": actual_output_tokens,
+        "cost_usd": round(cost_usd, 6),
+        "model": request.model,
+        "context_window": context_window,
+        "compaction_stats": {
+            "original_tokens": original_chunk_tokens,
+            "compressed_tokens": compressed_chunk_tokens,
+            "ratio": round(compressed_chunk_tokens / original_chunk_tokens, 3) if original_chunk_tokens > 0 else 1.0,
+        },
+    }
