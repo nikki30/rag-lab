@@ -61,13 +61,11 @@ Where this is headed next. The goal is to teach the modern RAG field deeply by b
 
 ### 🎯 Next up
 
-**1. Model mismatch demo** — Embed your documents with one model and query with a different one. Watch retrieval silently break. Production teams hit this bug when they upgrade embedding models without re-indexing — no error, just retrieval that suddenly returns nonsense. Visceral lesson, impossible to get from a tutorial.
+**1. HyDE — Hypothetical Document Embedding** — Instead of embedding the query, ask an LLM to generate a hypothetical *answer* to it first, then embed *that* as the search vector. Outperforms direct query embedding because question phrasing rarely matches document phrasing — but a hypothetical answer does. (Gao et al., 2022.)
 
-**2. HyDE — Hypothetical Document Embedding** — Instead of embedding the query, ask an LLM to generate a hypothetical *answer* to it first, then embed *that* as the search vector. Outperforms direct query embedding because question phrasing rarely matches document phrasing — but a hypothetical answer does. (Gao et al., 2022.)
+**2. Contextual chunking (Anthropic, 2024)** — Prepend an LLM-generated context summary to each chunk before embedding ("This chunk is from a 2023 annual report describing Q3 revenue"). Anthropic's paper showed dramatic retrieval improvements. Will demonstrate the lift visibly through Stage 6 eval scores.
 
-**3. Contextual chunking (Anthropic, 2024)** — Prepend an LLM-generated context summary to each chunk before embedding ("This chunk is from a 2023 annual report describing Q3 revenue"). Anthropic's paper showed dramatic retrieval improvements. Will demonstrate the lift visibly through Stage 6 eval scores.
-
-**4. LLM-as-judge evaluation toggle** — Switch Stage 6 from cosine-based metrics to a real LLM judging the answers (Claude / GPT-4 / local Llama via Ollama). Head-to-head comparison shows the gap between fast embedding metrics and high-fidelity LLM scoring — the same trade-off Microsoft Azure AI Eval and Anthropic's evaluation systems navigate in production.
+**3. LLM-as-judge evaluation toggle** — Switch Stage 6 from cosine-based metrics to a real LLM judging the answers (Claude / GPT-4 / local Llama via Ollama). Head-to-head comparison shows the gap between fast embedding metrics and high-fidelity LLM scoring — the same trade-off Microsoft Azure AI Eval and Anthropic's evaluation systems navigate in production.
 
 ### 🚀 The bigger features
 
@@ -77,11 +75,14 @@ Where this is headed next. The goal is to teach the modern RAG field deeply by b
 
 **ColPali / multi-modal RAG (2024)** — Move RAG beyond text. ColPali uses late interaction on rendered document *images*, retrieving by visual layout instead of OCR'd text. Will enable RAG over real PDFs, tables, charts, and slide decks — closer to production reality.
 
+**PDF / document upload — production realism** — Move beyond pasted text. Native upload for PDFs, web pages, and structured documents with proper parsing (tables, headings, layout). Lets you run the whole lab over your own corpus — turning RAG Lab from "learn RAG" into "learn RAG with my documents."
+
 ### 🧪 Polish + smaller features
 
 - **"Why did it fail?" diagnostic** — When faithfulness drops below 0.5, trace the failure back through every pipeline stage to identify root cause
 - **BGE asymmetric prefix demo** — Show `query:` vs `passage:` prefix effect on retrieval quality
 - **Long-context vs RAG tradeoff** — With Gemini 2M and Claude 200k, show same query as full-doc-in-context vs RAG, compare cost + quality
+- **Pipeline scorecard export** — Export the radar chart and metric summary as a shareable image, suitable for blog posts, presentations, or social sharing
 
 ### ⚠️ Described but not yet wired up
 
