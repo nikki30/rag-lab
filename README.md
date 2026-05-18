@@ -12,7 +12,7 @@
 
 <br>
 
-**[Pipeline stages](#pipeline-stages)** · **[Quick start](#running-locally)** · **[Concept guides](#reference-notes)** · **[SOTA concepts](#state-of-the-art-concepts-woven-in-throughout)**
+**[Quick start](#-quick-start)** · **[Pipeline stages](#-pipeline-stages)** · **[Roadmap](#-roadmap)** · **[Concept guides](#-concept-guides)** · **[SOTA concepts](#-state-of-the-art-concepts-woven-in)**
 
 </div>
 
@@ -22,78 +22,143 @@
 
 <br>
 
-## Pipeline stages
+## ⚡ Quick start
+
+```bash
+# Backend
+cd backend
+venv/Scripts/uvicorn main:app --port 8000
+
+# Frontend (new terminal)
+cd frontend
+npm run dev
+```
+
+Then open **http://localhost:3000** and work down the page — chunk → embed → index → retrieve → generate → evaluate.
+
+> First run downloads embedding models (~90–400 MB depending on model). Subsequent runs use the cache.
+> For the Generation stage, install [Ollama](https://ollama.com) and run `ollama pull llama3.2` — runs locally, no API key, no cost. [Full LLM setup ↓](#full-llm-setup)
+
+<br>
+
+## 🧬 Pipeline stages
 
 | Stage | Status | What you can do |
 |-------|--------|-----------------|
-| **Chunking** | ✅ Done | Compare 5 strategies (recursive, fixed, paragraph, sentence, semantic), tune parameters, inspect per-chunk quality scores, and see topic-similarity between sentences on a live chart. Semantic chunking uses real MiniLM embeddings — threshold changes produce visibly different chunk boundaries. |
-| **Embedding** | ✅ Done | Embed chunks with 4 local models (MiniLM, BGE-Small, MPNet, Nomic), visualise the vector space with PCA / UMAP / PaCMAP, inspect the cosine similarity heatmap with chunking-issue detection, and explore raw vector values |
-| **Indexing** | ✅ Done | Build Flat / HNSW / IVF / MRL indexes over your embedded vectors. Visualise the real HNSW multilayer graph with layer-by-layer traversal, IVF cluster boundaries with nprobe selection, and MRL dimension-truncation recall table. Orange/green colour coding distinguishes index-rebuild vs query-only parameters. See `docs/indexing101.md` for concept notes. |
-| **Retrieval** | ✅ Done | Type a query, embed it, and watch it find the nearest chunks — compare dense (cosine), sparse (BM25), and hybrid (RRF) side-by-side. Experiment with HyDE (hypothetical document embedding) and query decomposition. See `docs/retrieval101.md`. |
-| **Reranking** | ✅ Done | Cross-encoder re-scores the top-k retrieval candidates with full query-chunk interaction. ColBERT late interaction shows token-level MaxSim heatmaps. Rank shift table compares all four strategies side-by-side. |
-| **Generation** | ✅ Done | Select an LLM (Ollama local, Groq free tier, OpenAI, Anthropic), choose a compaction strategy (raw / contextual / LLMLingua), chunk ordering, and context strategy — then see the assembled prompt breakdown and grounding highlighting on the answer. |
-| **Evaluation** | ✅ Done | Score the full pipeline end-to-end with [RAGAS](https://docs.ragas.io)-style metrics — Faithfulness, Answer Relevancy, Context Precision, Context Recall, and Noise Sensitivity. Radar chart, sentence-level grounding breakdown, chunk relevance table, and optional ground truth recall. |
+| **Chunking** | ✅ Done | Compare 5 strategies (recursive, fixed, paragraph, sentence, semantic), tune parameters, inspect per-chunk quality scores, watch topic-similarity between sentences on a live chart. Semantic chunking uses real MiniLM embeddings — threshold changes produce visibly different chunk boundaries. |
+| **Embedding** | ✅ Done | Embed chunks with 4 local models (MiniLM, BGE-Small, MPNet, Nomic). Visualise the vector space with PCA / UMAP / PaCMAP, inspect the cosine similarity heatmap with chunking-issue detection, and explore raw vector values per chunk. |
+| **Indexing** | ✅ Done | Build Flat / HNSW / IVF / MRL indexes. Visualise the real HNSW multilayer graph with layer-by-layer traversal, IVF cluster boundaries with `nprobe` selection, and the MRL dimension-truncation recall table. Orange/green colour coding distinguishes rebuild vs query-only parameters. |
+| **Retrieval** | ✅ Done | Type a query, embed it, watch it find the nearest chunks. Compare dense (cosine), sparse (BM25), and hybrid (Reciprocal Rank Fusion) side-by-side. |
+| **Reranking** | ✅ Done | Cross-encoder re-scores the top-k candidates with full query-chunk interaction. ColBERT late interaction shows token-level MaxSim heatmaps. Rank shift table compares all four strategies in one view. |
+| **Generation** | ✅ Done | Pick an LLM (Ollama local, Groq free tier, OpenAI, Anthropic). Apply contextual compaction. Control chunk ordering (relevance vs sandwich). See the assembled prompt broken down by section, real token cost, and per-sentence grounding highlighting on the answer. |
+| **Evaluation** | ✅ Done | Score the full pipeline end-to-end with [RAGAS](https://docs.ragas.io)-style metrics — Faithfulness, Answer Relevancy, Context Precision, Context Recall, Noise Sensitivity. Radar chart, sentence-level grounding breakdown, per-rank chunk relevance table, optional ground truth coverage check. |
 
-### State-of-the-art concepts woven in throughout
+<br>
 
-| Concept | Stage |
-|---------|-------|
-| Contextual chunking (Anthropic) — prepend per-chunk summaries before embedding | Chunking |
-| Late chunking — embed the full document first, then pool chunk token windows | Chunking / Embedding |
-| HyDE — generate a hypothetical answer and embed *that* as the query | Retrieval |
-| Query decomposition — split a complex question into focused sub-queries | Retrieval |
-| ColBERT late interaction — token-level MaxSim scoring between query and chunk | Reranking |
-| GraphRAG — knowledge-graph traversal as an alternative to pure vector search | Retrieval / Generation |
+## 🗺️ Roadmap
 
-## Reference notes
+Where this is headed next. The goal is to teach the modern RAG field deeply by building it visually — each item below explains a SOTA technique you'll be able to *see* working, not just read about.
 
-- [`docs/chunking101.md`](docs/chunking101.md) — 5 strategies compared, quality scores, hub chunks, σ, contextual chunking, late chunking
+### 🎯 Next up
+
+**1. Model mismatch demo** — Embed your documents with one model and query with a different one. Watch retrieval silently break. Production teams hit this bug when they upgrade embedding models without re-indexing — no error, just retrieval that suddenly returns nonsense. Visceral lesson, impossible to get from a tutorial.
+
+**2. HyDE — Hypothetical Document Embedding** — Instead of embedding the query, ask an LLM to generate a hypothetical *answer* to it first, then embed *that* as the search vector. Outperforms direct query embedding because question phrasing rarely matches document phrasing — but a hypothetical answer does. (Gao et al., 2022.)
+
+**3. Contextual chunking (Anthropic, 2024)** — Prepend an LLM-generated context summary to each chunk before embedding ("This chunk is from a 2023 annual report describing Q3 revenue"). Anthropic's paper showed dramatic retrieval improvements. Will demonstrate the lift visibly through Stage 6 eval scores.
+
+**4. LLM-as-judge evaluation toggle** — Switch Stage 6 from cosine-based metrics to a real LLM judging the answers (Claude / GPT-4 / local Llama via Ollama). Head-to-head comparison shows the gap between fast embedding metrics and high-fidelity LLM scoring — the same trade-off Microsoft Azure AI Eval and Anthropic's evaluation systems navigate in production.
+
+### 🚀 The bigger features
+
+**Pipeline comparison mode** — Run the same query through two different pipeline configurations side-by-side. See two radar charts diff'd. Instantly shows that pipeline decisions actually matter.
+
+**GraphRAG (Microsoft Research, 2024)** — Build an interactive knowledge graph from your documents using LLM-extracted entities and relationships, then traverse it with global search (community summarisation) vs local search (subgraph traversal). The biggest 2024 advance in RAG, and no visual learning tool for it exists anywhere on the web.
+
+**ColPali / multi-modal RAG (2024)** — Move RAG beyond text. ColPali uses late interaction on rendered document *images*, retrieving by visual layout instead of OCR'd text. Will enable RAG over real PDFs, tables, charts, and slide decks — closer to production reality.
+
+### 🧪 Polish + smaller features
+
+- **"Why did it fail?" diagnostic** — When faithfulness drops below 0.5, trace the failure back through every pipeline stage to identify root cause
+- **BGE asymmetric prefix demo** — Show `query:` vs `passage:` prefix effect on retrieval quality
+- **Long-context vs RAG tradeoff** — With Gemini 2M and Claude 200k, show same query as full-doc-in-context vs RAG, compare cost + quality
+
+### ⚠️ Described but not yet wired up
+
+A few advanced techniques are referenced in tooltips and concept docs for educational context, but the implementations are not yet complete. These appear greyed out in the UI.
+
+- **Stage 5 — Compaction:** LLMLingua, LLMLingua-2 (Microsoft), RECOMP (Google)
+- **Stage 5 — Context strategies:** Map-Reduce, Refine, Map-Rerank (only Stuffing is currently active)
+- **Stage 1 — Late chunking** (Jina, 2024) — described in `docs/chunking101.md` but not yet a selectable strategy
+
+<br>
+
+## 🧠 State-of-the-art concepts woven in
+
+| Concept | Where to see it |
+|---------|----------------|
+| Contextual chunking (Anthropic, 2024) — prepend per-chunk summaries before embedding | Chunking — *roadmap* |
+| Late chunking (Jina, 2024) — embed the full document first, then pool chunk token windows | Chunking / Embedding — *docs/chunking101.md* |
+| Matryoshka Representation Learning (MRL) — truncate 768d vectors gracefully to 64d | Indexing — *active in MRL index tab* |
+| HNSW (Malkov & Yashunin) — hierarchical navigable small-world graph | Indexing — *active, with traversal viz* |
+| HyDE (Gao et al., 2022) — generate a hypothetical answer, embed *that* as the query | Retrieval — *roadmap* |
+| Query decomposition — split complex questions into sub-queries | Retrieval — *roadmap* |
+| Reciprocal Rank Fusion — merge dense + sparse retrieval | Retrieval — *active* |
+| Cross-encoder reranking (ms-marco-MiniLM) | Reranking — *active* |
+| ColBERT late interaction — token-level MaxSim scoring | Reranking — *active, with heatmap viz* |
+| Lost-in-the-Middle (Liu et al., 2023) — recency / primacy bias in long contexts | Generation — *active, drives chunk-order options* |
+| Contextual compaction — query-conditioned chunk filtering | Generation — *active* |
+| RAGAS evaluation (Faithfulness, Relevancy, Precision, Recall) | Evaluation — *active* |
+| LLM-as-judge (Microsoft G-EVAL, Anthropic model-graded eval) | Evaluation — *roadmap* |
+| GraphRAG (Microsoft Research, 2024) — knowledge graph traversal | Retrieval / Generation — *roadmap* |
+| ColPali (2024) — late interaction on document images | Retrieval — *roadmap* |
+
+<br>
+
+## 📚 Concept guides
+
+Each stage has a long-form concept guide explaining the algorithms and intuitions, with references to the foundational papers and how Microsoft / Anthropic / Google deploy them in production.
+
+- [`docs/chunking101.md`](docs/chunking101.md) — 5 strategies compared, quality scores, hub chunks, σ, contextual + late chunking
 - [`docs/embedding101.md`](docs/embedding101.md) — vectors, cosine similarity, MRL, PCA vs UMAP vs PaCMAP, heatmap interpretation
-- [`docs/indexing101.md`](docs/indexing101.md) — FAISS, HNSW, IVF, Flat explained with build vs query parameter breakdown
+- [`docs/indexing101.md`](docs/indexing101.md) — FAISS, HNSW, IVF, Flat — build vs query parameter breakdown
 - [`docs/retrieval101.md`](docs/retrieval101.md) — Dense, BM25, RRF hybrid, cross-encoder re-ranking, ColBERT late interaction
 - [`docs/reranking101.md`](docs/reranking101.md) — Cross-encoder vs ColBERT, rank shift analysis, MonoT5/DuoT5, Cohere Rerank, Lost-in-the-Middle, Microsoft Semantic Ranking
 - [`docs/generate101.md`](docs/generate101.md) — token budget problem, compaction algorithms, chunk ordering, context strategies
 - [`docs/eval101.md`](docs/eval101.md) — RAGAS metrics, LLM-as-judge, Microsoft Azure AI Eval, Anthropic model-graded evaluation, TruLens RAG Triad
 
-## Stack
+<br>
 
-- **Backend** — FastAPI, Python, LangChain text splitters, sentence-transformers, scikit-learn, FAISS, umap-learn, pacmap
-- **Frontend** — Next.js, React, TypeScript, Tailwind CSS v4, App Router
+## 🛠️ Stack
 
-## Running locally
+- **Backend** — FastAPI · Python · LangChain text splitters · sentence-transformers · scikit-learn · FAISS · umap-learn · pacmap
+- **Frontend** — Next.js 16 · React 19 · TypeScript · Tailwind CSS v4 · App Router
 
-```bash
-# Backend — hard-restart required after any main.py change
-cd backend
-venv/Scripts/uvicorn main:app --port 8000
+<br>
 
-# Frontend
-cd frontend
-npm run dev   # → http://localhost:3000
-```
+## 📦 Full LLM setup
+
+The Generation stage supports four providers. Easiest by far is **Ollama** (local, no key, no cost).
+
+**Ollama** *(recommended for first run)*
+1. Install from [ollama.com](https://ollama.com)
+2. Pull the Llama 3.2 model: `ollama pull llama3.2` *(~2 GB download)*
+3. Ollama starts automatically — no separate server command needed
+
+**Groq** *(free cloud tier, no credit card)*
+1. Sign up at [console.groq.com](https://console.groq.com)
+2. Set `GROQ_API_KEY` in `backend/.env`
+
+**OpenAI / Anthropic**
+Set `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` in `backend/.env`.
+
+<br>
+
+### Troubleshooting
 
 If port 8000 is stuck:
 ```bash
 powershell -Command "Get-Process python* | Stop-Process -Force"
 ```
 
-> First run downloads models: embedding stage (~90–400 MB depending on model), semantic chunking stage (MiniLM, ~90 MB). Subsequent runs use the cached version.
-
-### Generation stage — LLM setup
-
-The Generation stage supports four providers. The easiest to get started with is **Ollama** (runs entirely locally, no API key, no cost):
-
-**Ollama (recommended for first run)**
-1. Download and install from [ollama.com](https://ollama.com)
-2. Pull the Llama 3.2 model:
-```bash
-ollama pull llama3.2
-```
-3. Ollama starts automatically — no separate server command needed. The model runs on your machine (~2 GB download).
-
-**Groq (free cloud tier)**
-1. Sign up at [console.groq.com](https://console.groq.com) — free tier, no credit card
-2. Create an API key and set it as `GROQ_API_KEY` in `backend/.env`
-
-**OpenAI / Anthropic**
-Set `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` in `backend/.env`.
+The backend requires a hard restart after any `main.py` change (FastAPI's `--reload` is off by default for stability).
