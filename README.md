@@ -21,7 +21,7 @@
 
 <br>
 
-**[Quick start](#-quick-start)** · **[Pipeline stages](#-pipeline-stages)** · **[Roadmap](#-roadmap)** · **[Concept guides](#-concept-guides)** · **[SOTA concepts](#-state-of-the-art-concepts-woven-in)**
+**[Quick start](#-quick-start)** · **[Pipeline stages](#-pipeline-stages)** · **[Concept guides](#-concept-guides)** · **[SOTA concepts](#-state-of-the-art-concepts-woven-in)**
 
 </div>
 
@@ -44,7 +44,7 @@ cd rag-lab
 # Backend
 cd backend
 python -m venv venv
-source venv/Scripts/activate    # Windows: venv\Scripts\activate
+source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 uvicorn main:app --port 8000
 ```
@@ -90,64 +90,19 @@ The Generation stage uses a fully local mock LLM — no API calls, no tokens, no
 
 <br>
 
-## 🗺️ Roadmap
-
-Where this is headed next. The goal is to teach the modern RAG field deeply by building it visually — each item below explains a SOTA technique you'll be able to *see* working, not just read about.
-
-### 🎯 Next up
-
-**1. HyDE — Hypothetical Document Embedding** — Instead of embedding the query, ask an LLM to generate a hypothetical *answer* to it first, then embed *that* as the search vector. Outperforms direct query embedding because question phrasing rarely matches document phrasing — but a hypothetical answer does. (Gao et al., 2022.)
-
-**2. Contextual chunking (Anthropic, 2024)** — Prepend an LLM-generated context summary to each chunk before embedding ("This chunk is from a 2023 annual report describing Q3 revenue"). Anthropic's paper showed dramatic retrieval improvements. Will demonstrate the lift visibly through Stage 6 eval scores.
-
-**3. LLM-as-judge evaluation toggle** — Switch Stage 6 from cosine-based metrics to a real LLM judging the answers (Claude / GPT-4 / local Llama via Ollama). Head-to-head comparison shows the gap between fast embedding metrics and high-fidelity LLM scoring — the same trade-off Microsoft Azure AI Eval and Anthropic's evaluation systems navigate in production.
-
-### 🚀 The bigger features
-
-**Pipeline comparison mode** — Run the same query through two different pipeline configurations side-by-side. See two radar charts diff'd. Instantly shows that pipeline decisions actually matter.
-
-**GraphRAG (Microsoft Research, 2024)** — Build an interactive knowledge graph from your documents using LLM-extracted entities and relationships, then traverse it with global search (community summarisation) vs local search (subgraph traversal). The biggest 2024 advance in RAG, and no visual learning tool for it exists anywhere on the web.
-
-**ColPali / multi-modal RAG (2024)** — Move RAG beyond text. ColPali uses late interaction on rendered document *images*, retrieving by visual layout instead of OCR'd text. Will enable RAG over real PDFs, tables, charts, and slide decks — closer to production reality.
-
-**PDF / document upload — production realism** — Move beyond pasted text. Native upload for PDFs, web pages, and structured documents with proper parsing (tables, headings, layout). Lets you run the whole lab over your own corpus — turning RAG Lab from "learn RAG" into "learn RAG with my documents."
-
-### 🧪 Polish + smaller features
-
-- **"Why did it fail?" diagnostic** — When faithfulness drops below 0.5, trace the failure back through every pipeline stage to identify root cause
-- **BGE asymmetric prefix demo** — Show `query:` vs `passage:` prefix effect on retrieval quality
-- **Long-context vs RAG tradeoff** — With Gemini 2M and Claude 200k, show same query as full-doc-in-context vs RAG, compare cost + quality
-- **Pipeline scorecard export** — Export the radar chart and metric summary as a shareable image, suitable for blog posts, presentations, or social sharing
-
-### ⚠️ Described but not yet wired up
-
-A few advanced techniques are referenced in tooltips and concept docs for educational context, but the implementations are not yet complete. These appear greyed out in the UI.
-
-- **Stage 5 — Compaction:** LLMLingua, LLMLingua-2 (Microsoft), RECOMP (Google)
-- **Stage 5 — Context strategies:** Map-Reduce, Refine, Map-Rerank (only Stuffing is currently active)
-- **Stage 1 — Late chunking** (Jina, 2024) — described in `docs/chunking101.md` but not yet a selectable strategy
-
-<br>
-
 ## 🧠 State-of-the-art concepts woven in
 
 | Concept | Where to see it |
 |---------|----------------|
-| Contextual chunking (Anthropic, 2024) — prepend per-chunk summaries before embedding | Chunking — *roadmap* |
-| Late chunking (Jina, 2024) — embed the full document first, then pool chunk token windows | Chunking / Embedding — *docs/chunking101.md* |
+| Late chunking (Jina, 2024) — embed the full document first, then pool chunk token windows | Chunking — *[docs/chunking101.md](docs/chunking101.md)* |
 | Matryoshka Representation Learning (MRL) — truncate 768d vectors gracefully to 64d | Indexing — *active in MRL index tab* |
 | HNSW (Malkov & Yashunin) — hierarchical navigable small-world graph | Indexing — *active, with traversal viz* |
-| HyDE (Gao et al., 2022) — generate a hypothetical answer, embed *that* as the query | Retrieval — *roadmap* |
-| Query decomposition — split complex questions into sub-queries | Retrieval — *roadmap* |
 | Reciprocal Rank Fusion — merge dense + sparse retrieval | Retrieval — *active* |
 | Cross-encoder reranking (ms-marco-MiniLM) | Reranking — *active* |
 | ColBERT late interaction — token-level MaxSim scoring | Reranking — *active, with heatmap viz* |
 | Lost-in-the-Middle (Liu et al., 2023) — recency / primacy bias in long contexts | Generation — *active, drives chunk-order options* |
 | Contextual compaction — query-conditioned chunk filtering | Generation — *active* |
 | RAGAS evaluation (Faithfulness, Relevancy, Precision, Recall) | Evaluation — *active* |
-| LLM-as-judge (Microsoft G-EVAL, Anthropic model-graded eval) | Evaluation — *roadmap* |
-| GraphRAG (Microsoft Research, 2024) — knowledge graph traversal | Retrieval / Generation — *roadmap* |
-| ColPali (2024) — late interaction on document images | Retrieval — *roadmap* |
 
 <br>
 
