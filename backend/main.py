@@ -819,32 +819,21 @@ async def retrieve(request: RetrieveRequest):
 # STAGE 5 — GENERATION
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Mock models — no real LLM is called. Numbers are kept realistic so the
+# cost / context-window visualisations still illustrate the trade-offs.
 MODEL_CONTEXT_WINDOWS: dict[str, int] = {
-    "gpt-4o-mini": 128_000,
-    "gpt-4o": 128_000,
-    "claude-haiku-4-5-20251001": 200_000,
-    "claude-sonnet-4-6": 200_000,
-    "llama-3.3-70b-versatile": 128_000,
-    "llama-3.1-8b-instant": 128_000,
-    "gemma2-9b-it": 8_192,
-    "mixtral-8x7b-32768": 32_768,
-    # Ollama local models
-    "llama3.2": 128_000,
-    "gemma3": 128_000,
-    "mistral": 32_000,
-    "phi4": 16_000,
+    "mock-gpt-4o-mini": 128_000,
+    "mock-claude-haiku": 200_000,
+    "mock-llama-3-70b": 128_000,
+    "mock-llama-3-local": 128_000,
 }
 
 MODEL_PRICING: dict[str, tuple[float, float]] = {
     # (input_per_million_tokens, output_per_million_tokens)
-    "gpt-4o-mini": (0.15, 0.60),
-    "gpt-4o": (2.50, 10.00),
-    "claude-haiku-4-5-20251001": (0.80, 4.00),
-    "claude-sonnet-4-6": (3.00, 15.00),
-    "llama-3.3-70b-versatile": (0.0, 0.0),
-    "llama-3.1-8b-instant": (0.0, 0.0),
-    "gemma2-9b-it": (0.0, 0.0),
-    "mixtral-8x7b-32768": (0.0, 0.0),
+    "mock-gpt-4o-mini": (0.15, 0.60),
+    "mock-claude-haiku": (0.80, 4.00),
+    "mock-llama-3-70b": (0.0, 0.0),
+    "mock-llama-3-local": (0.0, 0.0),
 }
 
 SYSTEM_PROMPT = (
@@ -863,11 +852,61 @@ class GenerateRequest(BaseModel):
     query: str
     chunks: list[GenerateChunk]
     model: str
-    api_key: str
     compaction: str = "raw"              # "raw" | "contextual"
     chunk_order: str = "relevance_desc"  # "relevance_desc" | "relevance_asc" | "sandwich"
     context_strategy: str = "stuffing"  # "stuffing" | "map_reduce" | "refine" | "map_rerank"
     temperature: float = 0.1
+
+
+# Stop-words trimmed before scoring sentences against the query — keeps the
+# mock answer focused on content words instead of grammatical glue.
+_MOCK_STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "if", "is", "are", "was", "were",
+    "be", "been", "being", "what", "how", "why", "when", "where", "who", "which",
+    "whom", "of", "in", "on", "at", "to", "for", "with", "by", "as", "this",
+    "that", "these", "those", "it", "its", "do", "does", "did", "can", "could",
+    "should", "would", "will", "shall", "may", "might", "than", "then", "so",
+}
+
+
+def _mock_llm_answer(query: str, chunk_texts: list[str]) -> str:
+    """Deterministic stand-in for an LLM call.
+
+    Scores every sentence in the retrieved chunks by query-term overlap, picks
+    the strongest ~3, and presents them in chunk order with a brief preamble.
+    Because the sentences come straight from the context, downstream grounding
+    metrics behave the way they would for a faithful real-model answer.
+    """
+    if not chunk_texts:
+        return "I don't have enough context to answer that."
+
+    q_terms = {t for t in re.findall(r"\w+", query.lower()) if t not in _MOCK_STOPWORDS}
+
+    scored: list[tuple[int, int, int, str]] = []  # (overlap, chunk_idx, sent_idx, sent)
+    for ci, text in enumerate(chunk_texts):
+        for si, sent in enumerate(_split_sentences(text)):
+            tokens = set(re.findall(r"\w+", sent.lower()))
+            if not tokens:
+                continue
+            scored.append((len(tokens & q_terms), ci, si, sent))
+
+    if not scored:
+        return "I don't have enough context to answer that."
+
+    # Pick up to 3 best-overlap sentences; fall back to chunk leads when nothing matches.
+    top = sorted(scored, key=lambda x: (-x[0], x[1], x[2]))[:3]
+    if top[0][0] == 0:
+        leads: list[str] = []
+        for text in chunk_texts[:2]:
+            sents = _split_sentences(text)
+            if sents:
+                leads.append(sents[0])
+        body = " ".join(leads) if leads else chunk_texts[0][:300]
+        return f"Based on the retrieved context: {body}"
+
+    chosen = sorted(top, key=lambda x: (x[1], x[2]))
+    body = " ".join(s for _, _, _, s in chosen)
+    return f"Based on the retrieved context, {body}"
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -949,9 +988,6 @@ def _score_grounding(
 async def generate_answer(request: GenerateRequest):
     if not request.chunks:
         raise HTTPException(status_code=400, detail="No chunks provided")
-    OLLAMA_MODELS = {"llama3.2", "gemma3", "mistral", "phi4"}
-    if not request.api_key.strip() and request.model not in OLLAMA_MODELS:
-        raise HTTPException(status_code=400, detail="API key required")
     if request.model not in MODEL_CONTEXT_WINDOWS:
         raise HTTPException(status_code=400, detail=f"Unknown model: {request.model}")
 
@@ -988,74 +1024,14 @@ async def generate_answer(request: GenerateRequest):
     sections.append({"label": "User query", "text": request.query, "tokens": query_tokens,
                      "role": "query", "chunk_idx": None, "original_tokens": None})
 
-    # ── 4. Call LLM ───────────────────────────────────────────────────────────
-    context_str = "\n\n".join(
-        f"[Context {i + 1}]:\n{text}" for i, (_, text) in enumerate(pairs)
-    )
-    user_message = f"{context_str}\n\nQuestion: {request.query}"
-
-    answer = ""
+    # ── 4. Mock answer (no live LLM call) ─────────────────────────────────────
+    # The lab ships without any provider dependency so it runs cleanly straight
+    # off a clone. The mock generator selects supporting sentences from the
+    # retrieved chunks, which keeps grounding/relevancy visualisations meaningful.
+    chunk_texts_for_mock = [t for _, t in pairs]
+    answer = _mock_llm_answer(request.query, chunk_texts_for_mock)
     actual_input_tokens = sum(s["tokens"] for s in sections)
-    actual_output_tokens = 0
-
-    GROQ_MODELS = {"llama-3.3-70b-versatile", "llama-3.1-8b-instant", "gemma2-9b-it", "mixtral-8x7b-32768"}
-
-    def _openai_call(base_url: str | None, api_key: str) -> tuple[str, int, int]:
-        from openai import OpenAI
-        kwargs = {"api_key": api_key or "ollama"}
-        if base_url:
-            kwargs["base_url"] = base_url
-        client = OpenAI(**kwargs)
-        resp = client.chat.completions.create(
-            model=request.model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
-            ],
-            temperature=request.temperature,
-            max_tokens=1000,
-        )
-        return (
-            resp.choices[0].message.content or "",
-            resp.usage.prompt_tokens,
-            resp.usage.completion_tokens,
-        )
-
-    try:
-        if request.model.startswith("gpt"):
-            answer, actual_input_tokens, actual_output_tokens = _openai_call(None, request.api_key)
-
-        elif request.model.startswith("claude"):
-            from anthropic import Anthropic
-            client = Anthropic(api_key=request.api_key)
-            resp = client.messages.create(
-                model=request.model,
-                max_tokens=1000,
-                temperature=request.temperature,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": user_message}],
-            )
-            answer = resp.content[0].text
-            actual_input_tokens = resp.usage.input_tokens
-            actual_output_tokens = resp.usage.output_tokens
-
-        elif request.model in GROQ_MODELS:
-            answer, actual_input_tokens, actual_output_tokens = _openai_call(
-                "https://api.groq.com/openai/v1", request.api_key
-            )
-
-        else:
-            # Ollama — local OpenAI-compatible server, no real API key needed
-            answer, actual_input_tokens, actual_output_tokens = _openai_call(
-                "http://localhost:11434/v1", "ollama"
-            )
-
-    except Exception as e:
-        err = str(e)
-        if "11434" in err or "connection" in err.lower() and request.model in OLLAMA_MODELS:
-            raise HTTPException(status_code=503, detail="Ollama is not running. Start it with: ollama serve — then pull the model with: ollama pull " + request.model)
-        status = 401 if any(k in err.lower() for k in ("api key", "authentication", "invalid", "unauthorized")) else 500
-        raise HTTPException(status_code=status, detail=f"LLM error: {err}")
+    actual_output_tokens = _count_tokens(answer, request.model)
 
     # ── 5. Score grounding ────────────────────────────────────────────────────
     chunk_texts = [t for _, t in pairs]

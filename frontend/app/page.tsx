@@ -96,7 +96,7 @@ interface RetrieveResponse {
 }
 
 // ── Stage 5: Generate types ───────────────────────────────────────────────────
-type LLMProvider = 'openai' | 'anthropic' | 'groq' | 'ollama'
+type LLMProvider = 'mock'
 type CompactionAlgo = 'raw' | 'contextual' | 'llmlingua' | 'llmlingua2' | 'recomp'
 type ChunkOrderMode = 'relevance_desc' | 'relevance_asc' | 'sandwich'
 type ContextStrategy = 'stuffing' | 'map_reduce' | 'refine' | 'map_rerank'
@@ -126,13 +126,22 @@ interface GenerateResult {
   compaction_stats: { original_tokens: number; compressed_tokens: number; ratio: number }
 }
 
+// All four entries are mock profiles — no provider call is made. The
+// context-window and price values mirror real models so the cost and
+// "lost in the middle" visualisations still teach the trade-offs.
 const LLM_MODELS: LLMModel[] = [
-  { id: 'llama3.2', label: 'Llama 3.2 (Ollama)', provider: 'ollama', contextWindow: 128000,
-    inputPricePerM: 0, outputPricePerM: 0, tagline: 'Free · local · no key needed',
-    description: 'Runs entirely on your machine via Ollama — no API key, no cost, no data leaving your computer.\n\nInstall: ollama.com → then run: ollama pull llama3.2\n\nBecause it runs locally, latency depends on your hardware. A modern laptop CPU gives usable results; a GPU makes it fast.' },
-  { id: 'llama-3.3-70b-versatile', label: 'Llama 3.3 70B (Groq)', provider: 'groq', contextWindow: 128000,
-    inputPricePerM: 0, outputPricePerM: 0, tagline: 'Free · cloud · Groq API key',
-    description: 'Meta\'s Llama 3.3 70B running on Groq\'s LPU (Language Processing Unit) hardware — purpose-built silicon for transformer inference, not a GPU.\n\nFree tier at console.groq.com. Near-instant responses (~300 tokens/sec). The best free cloud option for RAG — strong reasoning, 128k context, no billing required.' },
+  { id: 'mock-gpt-4o-mini', label: 'GPT-4o-mini (mock)', provider: 'mock', contextWindow: 128000,
+    inputPricePerM: 0.15, outputPricePerM: 0.60, tagline: 'Cheap · 128k context',
+    description: 'Mock profile mirroring OpenAI\'s GPT-4o-mini pricing and context window.\n\nNo real network call is made — the answer is composed from the most query-relevant sentences in your retrieved chunks. This keeps the lab runnable with zero API keys while showing how cheaper models trade reasoning quality for cost.' },
+  { id: 'mock-claude-haiku', label: 'Claude Haiku (mock)', provider: 'mock', contextWindow: 200000,
+    inputPricePerM: 0.80, outputPricePerM: 4.00, tagline: 'Long context · 200k window',
+    description: 'Mock profile mirroring Anthropic Claude Haiku — wider 200k context window at higher per-token cost than GPT-4o-mini.\n\nUse it to see how doubling the context window changes the budget headroom in the visualiser. No real LLM call is made.' },
+  { id: 'mock-llama-3-70b', label: 'Llama 3.3 70B (mock)', provider: 'mock', contextWindow: 128000,
+    inputPricePerM: 0, outputPricePerM: 0, tagline: 'Free-tier · open-weights',
+    description: 'Mock profile representing a free-tier hosted open-weights model (Llama 3.3 70B on Groq, Together, or similar).\n\nZero per-token cost — useful for showing what changes when generation is "free" but still has a 128k context budget. No real network call is made.' },
+  { id: 'mock-llama-3-local', label: 'Local Llama 3.2 (mock)', provider: 'mock', contextWindow: 128000,
+    inputPricePerM: 0, outputPricePerM: 0, tagline: 'Local · no network',
+    description: 'Mock profile representing a fully local model (e.g. Llama 3.2 via Ollama).\n\nNo cost, no API key, no data leaving the box — but in real life latency depends on your hardware. Here the answer is synthesised deterministically from the retrieved chunks.' },
 ]
 
 const COMPACTION_ALGOS: { id: CompactionAlgo; label: string; tagline: string; available: boolean; description: string }[] = [
@@ -601,14 +610,12 @@ export default function Home() {
 
   // ── Generate stage ──
   const [genModel, setGenModel] = useState<LLMModel>(LLM_MODELS[0])
-  const [genApiKey, setGenApiKey] = useState('')
   const [genCompaction, setGenCompaction] = useState<CompactionAlgo>('raw')
   const [genChunkOrder, setGenChunkOrder] = useState<ChunkOrderMode>('relevance_desc')
   const [genContextStrategy, setGenContextStrategy] = useState<ContextStrategy>('stuffing')
   const [generateResult, setGenerateResult] = useState<GenerateResult | null>(null)
   const [generateLoading, setGenerateLoading] = useState(false)
   const [generateError, setGenerateError] = useState<string | null>(null)
-  const [apiKeyMissing, setApiKeyMissing] = useState(false)
   const generateSectionRef = useRef<HTMLDivElement>(null)
 
   // ── Evaluate stage ──
@@ -727,37 +734,28 @@ export default function Home() {
 
   async function handleGenerate() {
     if (!retrieveResult?.reranked.length) return
-    // Always scroll to stage 5 first so the user sees any errors
     generateSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-    if (genModel.provider !== 'ollama' && !genApiKey.trim()) { setApiKeyMissing(true); return }
-    setApiKeyMissing(false)
     setGenerateLoading(true); setGenerateError(null); setGenerateResult(null)
     try {
-      const controller = new AbortController()
-      const timeout = setTimeout(() => controller.abort(), 30000)
       const res = await fetch('http://localhost:8000/api/generate', {
         method: 'POST',
-        signal: controller.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           query: retrieveQuery,
           chunks: retrieveResult.reranked,
           model: genModel.id,
-          api_key: genApiKey,
           compaction: genCompaction,
           chunk_order: genChunkOrder,
           context_strategy: genContextStrategy,
           temperature: 0.1,
         }),
       })
-      clearTimeout(timeout)
       if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b?.detail ?? `Error ${res.status}`) }
       const data: GenerateResult = await res.json()
       setGenerateResult(data)
       setTimeout(() => generateSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100)
     } catch (e) {
-      const msg = e instanceof Error ? (e.name === 'AbortError' ? 'Request timed out after 30s — the LLM call took too long' : e.message) : 'Unknown error'
-      setGenerateError(msg)
+      setGenerateError(e instanceof Error ? e.message : 'Unknown error')
     }
     finally { setGenerateLoading(false) }
   }
@@ -2184,37 +2182,21 @@ export default function Home() {
               </div>
             </div>
 
-            {/* ── API Key ── */}
-            <div className="space-y-2">
-              {genModel.provider === 'ollama' ? (
-                <div className="flex items-center gap-3 rounded-xl border border-emerald-800/40 bg-emerald-950/20 px-4 py-3">
-                  <span className="text-emerald-400 text-sm">✓</span>
-                  <div>
-                    <p className="text-sm text-emerald-300 font-medium">No API key needed</p>
-                    <p className="text-xs text-zinc-500 mt-0.5">Ollama runs locally — make sure it's running and the model is pulled (<span className="font-mono">ollama pull {genModel.id}</span>)</p>
-                  </div>
-                </div>
-              ) : (
-                <>
-                  <div className="flex items-center gap-2">
-                    <p className="text-xs font-medium text-zinc-500 uppercase tracking-wider">
-                      {genModel.provider === 'openai' ? 'OpenAI' : genModel.provider === 'groq' ? 'Groq' : 'Anthropic'} API Key
-                    </p>
-                    <InfoTooltip
-                      title="API key"
-                      body={`Your key is used for exactly one API call and never stored or logged.\n\n${genModel.provider === 'openai' ? 'Get an OpenAI key at platform.openai.com → API keys.' : genModel.provider === 'groq' ? 'Get a free Groq key at console.groq.com → API Keys. Groq has a generous free tier with no billing required.' : 'Get an Anthropic key at console.anthropic.com → API keys.'}`}
-                    />
-                  </div>
-                  <input
-                    type="password"
-                    value={genApiKey}
-                    onChange={e => { setGenApiKey(e.target.value); if (e.target.value.trim()) setApiKeyMissing(false) }}
-                    placeholder={genModel.provider === 'groq' ? 'gsk_... (Groq API key — free at console.groq.com)' : `sk-... (${genModel.provider === 'openai' ? 'OpenAI' : 'Anthropic'} API key)`}
-                    className={`w-full max-w-md rounded-xl bg-zinc-900 border px-4 py-2.5 text-sm text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-2 ${apiKeyMissing ? 'border-red-500 ring-2 ring-red-500/40 focus:ring-red-500' : 'border-zinc-700 focus:ring-violet-600'}`}
+            {/* ── Mock-mode banner (no real LLM call is made) ── */}
+            <div className="flex items-start gap-3 rounded-xl border border-amber-800/40 bg-amber-950/20 px-4 py-3">
+              <span className="text-amber-400 text-sm leading-5">●</span>
+              <div className="flex-1">
+                <div className="flex items-center gap-2">
+                  <p className="text-sm text-amber-300 font-medium">Mock generation — no API key or network call</p>
+                  <InfoTooltip
+                    title="Why is generation mocked?"
+                    body={"This lab is intentionally runnable straight off a clone, without API keys or local model installs. The \"answer\" is composed deterministically from the retrieved chunks — specifically the sentences with the most overlap with your query.\n\nGrounding, faithfulness, and context-precision metrics still behave the way they would for a real model on a faithful answer, because the answer sentences literally come from the context.\n\nDrop a real provider call back into backend/main.py @ /api/generate to switch to a live LLM."}
                   />
-                  {apiKeyMissing && <p className="text-xs text-red-400 mt-1">API key is required to generate an answer</p>}
-                </>
-              )}
+                </div>
+                <p className="text-xs text-zinc-500 mt-0.5">
+                  The selected model only controls the cost and context-window numbers in the visualisations — the answer itself is synthesised from your retrieved chunks.
+                </p>
+              </div>
             </div>
 
             {/* ── Compaction ── */}
@@ -2553,7 +2535,7 @@ export default function Home() {
                       value: evalResult.answer_relevancy,
                       sub: 'cosine(query, answer)',
                       tooltipTitle: 'Answer Relevancy — does the answer address the query?',
-                      tooltipBody: "Am I actually answering the question that was asked?\n\n🎣 You caught the right fish — but delivered them to the wrong person.\n\nYour answer can be 100% grounded in the documents and still miss the point. Example: you ask 'what is the capital of France?' and the model faithfully quotes 'Paris has a population of 2.1 million.' Faithful — yes. Relevant — no.\n\nHow it's measured: embed the query and the answer as vectors, then take the cosine similarity between them. If the answer talks about the same thing as the question, they'll point in the same direction in embedding space.\n\nRAGAS goes further: it generates a few questions from the answer using an LLM, then checks if those reverse-engineered questions look like your original query. The idea is — if someone read your answer and tried to guess what question prompted it, would they arrive at your question?\n\nLow relevancy = the model answered a different question than you asked.",
+                      tooltipBody: "Am I actually answering the question that was asked?\n\nScore 1.0 = the answer vector points in the same direction as the query vector. Score 0.0 = the answer has nothing semantically to do with the question.\n\n🎣 You caught the right fish — but delivered them to the wrong customer.\n\nCrucial distinction from Faithfulness: an answer can be 100% grounded (every sentence traceable to a chunk) and still score low here. Example: you ask 'what caused the revenue drop?' and the model faithfully quotes 'Q3 revenue was $4.2M.' Faithful — yes. Relevant to the actual question — no.\n\nHow this lab measures it:\ncosine(embed(query), embed(full answer))\nBoth embedded as vectors. If they talk about the same concepts they'll point in similar directions in 384-dimensional embedding space.\n\nHow RAGAS measures it:\nGenerate 3–5 questions from the answer using an LLM, then average cosine similarity between those reverse-engineered questions and the original query. If someone read only your answer and tried to guess what question prompted it, would they arrive at your question? This catches vocabulary mismatches the simple cosine approach misses.\n\nLow relevancy usually means retrieval pulled the wrong chunks — the answer is grounded but in the wrong context. Fix at Stage 3/4 before blaming generation.",
                       color: evalResult.answer_relevancy >= 0.7 ? 'emerald' : evalResult.answer_relevancy >= 0.4 ? 'amber' : 'red',
                     },
                     {
@@ -2561,7 +2543,7 @@ export default function Home() {
                       value: evalResult.context_precision,
                       sub: `${evalResult.n_relevant_chunks}/${evalResult.n_chunks} chunks relevant`,
                       tooltipTitle: 'Context Precision — did we retrieve the right chunks, ranked first?',
-                      tooltipBody: "Of the chunks I retrieved, how many were actually useful — and were the best ones first?\n\n🎣 Of the fish in your net, what fraction were the ones you wanted — and were the best ones at the top, not buried at the bottom?\n\nPrecision = quality of what you retrieved. A retriever returning 10 chunks where only 2 are relevant has low precision — 8 chunks are noise eating your context budget and confusing the model.\n\nThe 'ranked first' part matters: relevant chunks buried at rank 8 are less useful than ones at rank 1, because compaction and LLM attention both favour early context.\n\nFormula: RAGAS weighted precision@k — relevant chunks ranked higher contribute more to the score.\n\nFix low precision: reduce top-k, improve your embedding model, or add a reranker (Stage 4).",
+                      tooltipBody: "Of the chunks I retrieved, how many were actually useful — and were the best ones ranked first?\n\nScore 1.0 = every retrieved chunk was relevant, most-relevant at rank 1. Score 0.0 = all chunks were irrelevant, or all the relevant ones were buried at the bottom.\n\n🎣 Of the fish in your net, what fraction were the ones you wanted — and were the best ones at the top, not buried under bycatch?\n\nHow this lab measures it:\nEach chunk is embedded and compared to the query (cosine similarity ≥ 0.30 = relevant). Then RAGAS weighted precision@k:\n\nCP = Σk [relevant_k × precision@k] / total_relevant\n\nWhere precision@k = (# relevant chunks in top-k) / k. A relevant chunk at rank 1 contributes more than the same chunk at rank 5.\n\nWhy ranking matters: compaction drops low-ranked sentences first, Lost-in-the-Middle means middle chunks get ignored by the LLM, and LLMLingua-2's query-conditioning still can't rescue a chunk ranked 10th. Evidence buried deep is evidence wasted.\n\nPrecision vs Recall: Precision asks 'were the chunks I got useful?' Recall (needs ground truth) asks 'did I miss any?' They're independent — you can have high precision (every chunk was great) but low recall (you missed half the relevant chunks).\n\nFix low precision: reduce top-k, switch embedding model (Stage 2), or add a cross-encoder reranker (Stage 4).",
                       color: evalResult.context_precision >= 0.7 ? 'emerald' : evalResult.context_precision >= 0.4 ? 'amber' : 'red',
                     },
                     {
@@ -2576,8 +2558,8 @@ export default function Home() {
                       label: 'Noise Sensitivity',
                       value: evalResult.noise_sensitivity,
                       sub: `${evalResult.n_contributing_chunks}/${evalResult.n_chunks} chunks used`,
-                      tooltipTitle: 'Noise Sensitivity — how much of the context was actually used?',
-                      tooltipBody: "How much of what I retrieved actually got used?\n\n🎣 You pulled up 10 fish, but only 2 made it to the dinner plate. The other 8 were bycatch — took up space in the boat and got thrown back.\n\nIf you retrieved 10 chunks and only 2 were cited by grounded sentences, 80% of your context budget was wasted. Those unused chunks cost tokens, can confuse the model, and increase hallucination risk.\n\nTruLens calls this 'context utilisation'. Fix: reduce top-k, use a cross-encoder reranker (Stage 4), or apply compaction (Stage 5) to strip irrelevant sentences before sending.\n\nNot a standard RAGAS metric but one of the most actionable in production.",
+                      tooltipTitle: 'Noise Sensitivity — how much of the retrieved context was actually used?',
+                      tooltipBody: "What fraction of retrieved chunks actually contributed to the answer?\n\nScore 1.0 = every chunk was cited by at least one grounded answer sentence — tight, efficient retrieval. Score 0.0 = no chunks contributed anything.\n\n🎣 You pulled up 10 fish but only 2 made it to the dinner plate. The other 8 took up space in the boat and got thrown back.\n\n⚠ Naming note: this lab uses the RAGAS term 'noise sensitivity' but measures context utilisation — fraction of retrieved chunks that were actually used. A HIGH score is GOOD. RAGAS's original definition is the inverse: how much does adding irrelevant chunks degrade the answer? Same underlying problem, opposite direction.\n\nHow this lab measures it:\nFor each grounded answer sentence, find the chunk it matched best (highest cosine sim). Count how many distinct chunks were 'cited' this way. Divide by total chunks retrieved.\n\nExample: 5 chunks retrieved, grounded sentences drew from 2 distinct chunks → score = 0.40. The other 3 chunks were pure token spend with no payoff.\n\nWhy it matters: every unused chunk costs input tokens, can introduce contradictory context, and reduces the LLM's effective attention on the chunks that matter. Unused chunks are cost with zero benefit.\n\nTruLens calls this 'context utilisation'. Fix low scores: reduce top-k, apply compaction (Stage 5), or add a cross-encoder reranker (Stage 4) to cut irrelevant candidates before generation.",
                       color: evalResult.noise_sensitivity >= 0.6 ? 'emerald' : evalResult.noise_sensitivity >= 0.3 ? 'amber' : 'red',
                     },
                   ].map(({ label, value, sub, tooltipTitle, tooltipBody, color }) => {
