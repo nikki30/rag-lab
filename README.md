@@ -8,6 +8,15 @@
 
 <br>
 
+![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
+![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-009688?logo=fastapi&logoColor=white)
+![Next.js](https://img.shields.io/badge/Next.js-16-black?logo=next.js&logoColor=white)
+![No API Key](https://img.shields.io/badge/API%20Key-None%20Required-brightgreen)
+![License](https://img.shields.io/badge/License-MIT-yellow)
+
+<br>
+
 ![RAG Lab demo](docs/assets/RAGLABDemo.gif)
 
 <br>
@@ -24,20 +33,34 @@
 
 ## ⚡ Quick start
 
+**Prerequisites:** Python 3.10+, Node.js 18+. No API keys. No cloud accounts. Runs entirely on your machine.
+
+```bash
+git clone https://github.com/nikki30/rag-lab.git
+cd rag-lab
+```
+
 ```bash
 # Backend
 cd backend
-venv/Scripts/uvicorn main:app --port 8000
+python -m venv venv
+source venv/Scripts/activate    # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+uvicorn main:app --port 8000
+```
 
+```bash
 # Frontend (new terminal)
 cd frontend
+npm install
 npm run dev
 ```
 
 Then open **http://localhost:3000** and work down the page — chunk → embed → index → retrieve → generate → evaluate.
 
-> First run downloads embedding models (~90–400 MB depending on model). Subsequent runs use the cache.
-> For the Generation stage, install [Ollama](https://ollama.com) and run `ollama pull llama3.2` — runs locally, no API key, no cost. [Full LLM setup ↓](#full-llm-setup)
+> **First run** downloads embedding models (~90–400 MB depending on model chosen). Subsequent runs use the local cache.
+>
+> **Generation stage** works out of the box with a built-in mock LLM — no Ollama, no API key, no cloud service required. See [how the mock LLM works](#mock-llm).
 
 <br>
 
@@ -50,8 +73,20 @@ Then open **http://localhost:3000** and work down the page — chunk → embed �
 | **Indexing** | ✅ Done | Build Flat / HNSW / IVF / MRL indexes. Visualise the real HNSW multilayer graph with layer-by-layer traversal, IVF cluster boundaries with `nprobe` selection, and the MRL dimension-truncation recall table. Orange/green colour coding distinguishes rebuild vs query-only parameters. |
 | **Retrieval** | ✅ Done | Type a query, embed it, watch it find the nearest chunks. Compare dense (cosine), sparse (BM25), and hybrid (Reciprocal Rank Fusion) side-by-side. |
 | **Reranking** | ✅ Done | Cross-encoder re-scores the top-k candidates with full query-chunk interaction. ColBERT late interaction shows token-level MaxSim heatmaps. Rank shift table compares all four strategies in one view. |
-| **Generation** | ✅ Done | Pick an LLM (Ollama local, Groq free tier, OpenAI, Anthropic). Apply contextual compaction. Control chunk ordering (relevance vs sandwich). See the assembled prompt broken down by section, real token cost, and per-sentence grounding highlighting on the answer. |
+| **Generation** | ✅ Done | Choose from four mock LLMs (GPT-4o-mini, Claude Haiku, Llama 3.3 70B, Local Llama). Apply contextual compaction, control chunk ordering (relevance vs sandwich). See the assembled prompt broken down by section, real token cost, and per-sentence grounding highlighting on the answer. |
 | **Evaluation** | ✅ Done | Score the full pipeline end-to-end with [RAGAS](https://docs.ragas.io)-style metrics — Faithfulness, Answer Relevancy, Context Precision, Context Recall, Noise Sensitivity. Radar chart, sentence-level grounding breakdown, per-rank chunk relevance table, optional ground truth coverage check. |
+
+<br>
+
+## 🤖 Mock LLM
+
+The Generation stage uses a fully local mock LLM — no API calls, no tokens, no cost.
+
+**How it works:** The mock scores every sentence in the retrieved chunks by query-term overlap (ignoring stop words), selects the top 3, and assembles a coherent answer. It's deterministic — the same query produces the same answer every time.
+
+**What's still real:** Grounding scores, token counting, context window limits, cost estimates, compaction algorithms, and chunk ordering all behave exactly as they would with a real model. The pipeline mechanics you're learning are accurate.
+
+**Why mock?** So anyone can run the full pipeline immediately — no account, no credit card, no rate limits. When you understand how each stage works, you can swap in a real model with one line.
 
 <br>
 
@@ -137,29 +172,15 @@ Each stage has a long-form concept guide explaining the algorithms and intuition
 
 <br>
 
-## 📦 Full LLM setup
-
-The Generation stage supports four providers. Easiest by far is **Ollama** (local, no key, no cost).
-
-**Ollama** *(recommended for first run)*
-1. Install from [ollama.com](https://ollama.com)
-2. Pull the Llama 3.2 model: `ollama pull llama3.2` *(~2 GB download)*
-3. Ollama starts automatically — no separate server command needed
-
-**Groq** *(free cloud tier, no credit card)*
-1. Sign up at [console.groq.com](https://console.groq.com)
-2. Set `GROQ_API_KEY` in `backend/.env`
-
-**OpenAI / Anthropic**
-Set `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` in `backend/.env`.
-
-<br>
-
 ### Troubleshooting
 
 If port 8000 is stuck:
 ```bash
+# Windows
 powershell -Command "Get-Process python* | Stop-Process -Force"
+
+# macOS / Linux
+pkill -f uvicorn
 ```
 
 The backend requires a hard restart after any `main.py` change (FastAPI's `--reload` is off by default for stability).
